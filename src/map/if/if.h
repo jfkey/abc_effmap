@@ -311,6 +311,19 @@ struct If_Man_t_
     float              CutDelayCur;   // current cut delay returned by user callback
     int                fCutDelayCurValid; // indicates CutDelayCur is valid
 
+    // exact area pruning (Phase 1: submodular bounds)
+    float *            pMffcSizes;    // mffcSize[nodeId]: activation set size for MFFC nodes after deref
+    int *              pMffcStamps;   // generation stamp per node: valid iff == nMffcStamp
+    int                nMffcStamp;    // current generation stamp (incremented per deref)
+    int                nMffcTotal;    // total MFFC size from last deref (|M|)
+    int                fMffcIsTree;   // 1 if MFFC DAG is a tree (no reconvergence), 0 otherwise
+    // exact area pruning statistics
+    ABC_INT64_T        nExactPrune_Total;    // total candidate cuts evaluated in Mode=2
+    ABC_INT64_T        nExactPrune_FastPath; // cuts resolved by fast path (no ref/deref)
+    ABC_INT64_T        nExactPrune_LBPruned; // cuts pruned by lower bound
+    ABC_INT64_T        nExactPrune_UBAccept; // cuts accepted by upper bound (UB < bestArea)
+    ABC_INT64_T        nExactPrune_Exact;    // cuts requiring full ref/deref
+
     // timing manager
     Tim_Man_t *        pManTim;
     Vec_Int_t *        vCoAttrs;      // CO attributes   0=optimize; 1=keep; 2=relax
@@ -566,6 +579,10 @@ extern float           If_CutAreaDeref( If_Man_t * p, If_Cut_t * pCut );
 extern float           If_CutAreaRef( If_Man_t * p, If_Cut_t * pCut );
 extern float           If_CutAreaDerefed( If_Man_t * p, If_Cut_t * pCut );
 extern float           If_CutAreaRefed( If_Man_t * p, If_Cut_t * pCut );
+extern float           If_CutAreaDerefAndRecord( If_Man_t * p, If_Cut_t * pCut );
+extern float           If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float bestArea );
+extern void            If_CutAreaPruningStatsPrint( If_Man_t * p );
+extern void            If_CutAreaPruningStatsReset( If_Man_t * p );
 extern float           If_CutEdgeDeref( If_Man_t * p, If_Cut_t * pCut );
 extern float           If_CutEdgeRef( If_Man_t * p, If_Cut_t * pCut );
 extern float           If_CutEdgeDerefed( If_Man_t * p, If_Cut_t * pCut );

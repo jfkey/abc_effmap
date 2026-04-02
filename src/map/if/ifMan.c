@@ -487,6 +487,8 @@ void If_ManStop( If_Man_t * p )
         Vec_MemHashFree( p->vTtMem6 );
         Vec_MemFreeP( &p->vTtMem6 );
     }
+    ABC_FREE( p->pMffcSizes );
+    ABC_FREE( p->pMffcStamps );
     ABC_FREE( p->pMemCi );
     ABC_FREE( p->pMemAnd );
     ABC_FREE( p->puTemp[0] );

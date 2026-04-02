@@ -1,0 +1,713 @@
+================================================================================
+    子模函数视角下的 Exact Area Recovery 剪枝理论
+================================================================================
+参考代码: src/map/if/ifCut.c (If_CutAreaDeref/Ref/Derefed)
+         src/map/if/ifMap.c (If_ObjPerformMappingAnd, Mode=2)
+
+
+================================================================================
+第一章  问题定义与符号
+================================================================================
+
+---------- 1.1 背景 ----------
+
+FPGA technology mapping 的 exact area recovery (Mode=2) 阶段，对每个
+被引用的 AIG 节点 n (nRefs > 0)，执行以下流程：
+
+  (1) Deref(CutBest(n))         — 释放旧 best cut 占用的资源
+  (2) 对每个候选 cut C_i:
+        area_i = If_CutAreaDerefed(C_i)   — 模拟 ref+deref 评估精确面积
+  (3) 选择 area 最小且满足 timing 的 cut 作为新 CutBest
+  (4) Ref(CutBest_new(n))       — 引用新 best cut
+
+瓶颈在步骤 (2)：If_CutAreaDerefed 对每个候选 cut 做完整的 DFS ref+deref，
+代价为 O(|MFFC|)。当候选 cut 数量 M 较大时，总代价 O(M · |MFFC|)。
+
+目标：利用子模函数的数学性质，设计上/下界剪枝策略，减少步骤 (2) 的
+精确计算次数，同时保证最终结果与原始算法完全一致（exact，非近似）。
+
+---------- 1.2 符号定义 ----------
+
+  n          : 当前处理的 AIG AND 节点
+  x, y       : n 的两个 AIG fanin (pFanin0, pFanin1)
+  C_x, C_y   : x 和 y 的候选 cut 集合
+  L(C)       : cut C 的叶子集合, |L(C)| ≤ K (K-feasible)
+  CutBest(v) : 节点 v 当前的最佳 cut
+
+  在 Deref(CutBest(n)) 之后，定义：
+
+  M          : MFFC 区域 = {v : v 是 AND 节点, v.nRefs = 0}
+               即 deref 后引用计数降为 0 的所有 AND 节点
+  E          : 外部节点 = {v : v.nRefs > 0} ∪ {CI 节点}
+               即仍在 mapped circuit 中活跃的节点
+
+  对于叶子 l ∈ M (nRefs=0 的 AND 节点)，定义：
+
+  S(l)       : l 的激活集 (activation set)
+             = {l} ∪ {v ∈ M : 从 l 的 CutBest 叶子递归向下，
+                                经过 nRefs=0 的 AND 节点可达 v}
+
+  直观含义：如果在 derefed 状态下 ref 叶子 l，S(l) 就是 l 的 ref 递归
+  会"激活"（nRefs 从 0→1）的所有 AND 节点的集合。
+  每个激活的 AND 节点对应 mapped circuit 中一个 LUT。                                
+  
+  ------------------ 这个的表述应该不对 ? exact area 描述的应该是 局部可被优化的资源：激活的 AND 节点不一定对应一个LUT，而是激活的AND节点越多，可被优化的资源越少
+  或者更精确的 S(l) 定义为： 
+    S(l)       : l 的激活集 (activation set)
+             = {l} ∪ {v ∈ M : 从 l 的 CutBest 叶子递归向下，沿着叶子节点 的CutBest nodes，
+                                经过 nRefs=0 的 AND 节点可达 v}
+
+
+
+  对于叶子 l ∈ E (nRefs>0 或 CI)，定义 S(l) = ∅。
+  （它已经在 mapped circuit 中存在，ref 时 nRefs++ 后 > 0，不递归。）
+
+
+---------- 1.3 精确面积的集合论表达 ----------
+
+对于候选 cut C 的叶子集 L(C) = {l_1, ..., l_k}:
+
+  ExactArea(C) = LutArea(C) + |⋃_{l ∈ L(C)} S(l)|
+
+其中：
+  - LutArea(C) 是 cut 自身的 LUT 面积（通常 = 1.0）
+  - ⋃ S(l) 是所有叶子的激活集的并集
+
+这个表达式捕捉了 If_CutAreaRef 的行为：
+  - 首先计入 root LUT 的面积
+  - 对每个叶子 l：
+    - 若 l ∈ E (nRefs>0)：l.nRefs++ 后仍 > 0，不递归，不增加面积
+    - 若 l ∈ M (nRefs=0)：l.nRefs 从 0→1，递归 ref CutBest(l)，
+      过程中所有被激活的节点构成 S(l)
+  - 但如果两个叶子 l_i, l_j 的 S 有交集，交集中的节点只在第一次
+    被 ref 时计入（nRefs 已 > 0 后不再递归）
+  - 因此面积 = |并集|，不是 |和|
+
+注意：LutArea(C) 在标准 FPGA mapping 中通常 = 1.0，但在 LUT library
+模式下可能因 cut 大小而异。为了通用性，公式中保留 LutArea(C) 项。
+
+
+================================================================================
+第二章  子模函数建模
+================================================================================
+
+---------- 2.1 Coverage Function 定义 ----------
+
+定义集合函数 f : 2^U → R（U 是所有可能叶子的全集）：
+
+  f(L) = |⋃_{l ∈ L} S(l)|
+
+其中 S(l) 是第一章定义的激活集。那么：
+
+  ExactArea(C) = LutArea(C) + f(L(C))
+
+---------- 2.2 子模性证明 ----------
+
+定理：f(L) = |⋃_{l ∈ L} S(l)| 是子模函数。
+
+证明：
+  集合并集的大小是经典的 coverage function。
+  对于任意 A ⊆ B ⊆ U 和 x ∈ U \ B，需证明：
+
+    f(A ∪ {x}) - f(A) ≥ f(B ∪ {x}) - f(B)
+
+  左边 = |S(x) \ ⋃_{l∈A} S(l)|   — x 在 A 的背景下的新增覆盖
+  右边 = |S(x) \ ⋃_{l∈B} S(l)|   — x 在 B 的背景下的新增覆盖
+
+  因为 A ⊆ B → ⋃_{l∈A} S(l) ⊆ ⋃_{l∈B} S(l)
+  → S(x) \ ⋃_{l∈A} S(l) ⊇ S(x) \ ⋃_{l∈B} S(l)
+  → 左边 ≥ 右边                                                    □
+
+直观理解（边际递减性）：
+  在叶子集合越大的背景下，新增一个叶子带来的"新覆盖"越少，
+  因为更多的 MFFC 节点已经被现有叶子的 cone 覆盖了。
+
+---------- 2.3 附加性质 ----------
+
+性质 1 (非负性): f(L) ≥ 0，对所有 L。
+
+性质 2 (单调性): A ⊆ B → f(A) ≤ f(B)。
+  证明：⋃_{l∈A} S(l) ⊆ ⋃_{l∈B} S(l)。
+
+性质 3 (归一化): f(∅) = 0。
+
+性质 4 (模性条件): 当所有 S(l) 两两不相交时，
+  f 退化为模函数（可加函数）：f(L) = Σ_{l∈L} |S(l)|。
+  此时上界 = 下界 = 精确值，无需 ref/deref。
+
+性质 5 (有界性): f(L) ≤ |M|（最多覆盖整个 MFFC）。
+  且 f(L) ≤ Σ_{l∈L} |S(l)|（并集 ≤ 各集合大小之和）。
+
+
+================================================================================
+第三章  上界设计
+================================================================================
+
+---------- 3.1 UB-1: 独立和上界 (Independent Sum Bound) ----------
+
+  UB1(C) = LutArea(C) + Σ_{l ∈ L(C)} |S(l)|
+
+其中 |S(l)| 对 l ∈ E 为 0（因为 S(l) = ∅）。
+
+正确性证明：
+  |⋃ S(l)| ≤ Σ |S(l)|  (并集 ≤ 求和，标准集合不等式)
+  → ExactArea(C) ≤ UB1(C)                                          □
+
+计算代价：
+  预计算：Deref(CutBest(n)) 时，对每个在递归过程中 nRefs 降为 0 的
+  AND 节点 l，记录 |S(l)|。这可以在 Deref 的 DFS 过程中自然获得，
+  因为 If_CutAreaDeref 返回的面积就是 cone 的 LUT 数（包含自身）。
+
+  具体来说，在 Deref 递归时：
+    If_CutAreaDeref(CutBest(l)) 返回的面积
+    = LutArea(CutBest(l)) + 递归部分
+    这恰好等于 |S(l)|（S(l) 中每个节点贡献 LutArea = 1）
+
+  评估：对每个候选 cut，O(K) 求和（K 是 LUT 输入数上限）。
+
+紧致性分析：
+  当所有 S(l) 两两不相交时，UB1 = ExactArea（精确）。
+  当存在大量 cone 重叠时，UB1 远大于 ExactArea。
+  极端情况：k 个叶子的 S 完全相同，UB1 = k · ExactArea。
+
+---------- 3.2 UB-2: 贪心序上界 (Greedy Order Bound) ----------
+
+利用子模性的边际递减，选择一个好的序来得到更紧的上界。
+
+对 L(C) ∩ M = {l_1, ..., l_m} 按 |S(l)| 从大到小排序。
+
+定义 边际贡献:
+  Δ_1 = |S(l_1)| = |S(l_1)|                           (第一个，完整贡献)
+  Δ_i = |S(l_i) \ ⋃_{j<i} S(l_j)|                    (后续，新增贡献)
+
+则 f(L) = Σ Δ_i （精确，但 Δ_i 需要实际计算交集才能得到）。
+
+利用子模性的推论：
+
+  推论 3.1: 对于按 |S(l)| 从大到小排序的序，
+  Δ_i ≤ |S(l_i)|  （trivial，每步的边际不超过自身大小）
+
+  推论 3.2: Δ_i ≤ Δ_{i-1}  当 |S(l_i)| ≤ |S(l_{i-1})|
+  （子模性保证边际不增，但前提是集合按包含关系嵌套。
+    注意：按大小排序不等于按包含关系排序，所以这个推论需要更精细的条件。）
+
+实际可用的更紧上界：
+
+  UB2(C) = LutArea(C) + |S(l_1)| + Σ_{i≥2} min(|S(l_i)|, R_i)
+
+  其中 R_i 是 S(l_i) 中"不可能被前面的叶子覆盖"的节点数的上界。
+
+  一个实用的 R_i 估计：
+    R_i = |S(l_i)| - |S(l_i) ∩ S(l_1)|   (只减去与最大集合的交集)
+
+  但计算 |S(l_i) ∩ S(l_1)| 本身也需要 DFS，代价不低。
+  所以 UB2 的实用性取决于能否廉价地估计交集大小（见第六章）。
+
+---------- 3.3 UB-3: 包含消除上界 (Containment Elimination Bound) ----------
+
+观察：如果叶子 l_j ∈ S(l_i)（即 l_j 在 l_i 的激活集中），
+则 S(l_j) ⊆ S(l_i)，即 l_j 的整个 cone 被 l_i 的 cone 包含。
+
+此时 l_j 对 ⋃ S(l) 的贡献为 0（已被 l_i 完全覆盖）。
+
+  UB3(C) = LutArea(C) + Σ_{l ∈ L_indep(C)} |S(l)|
+
+  其中 L_indep(C) = {l ∈ L(C) ∩ M : 不存在 l' ∈ L(C) 使得 l ∈ S(l')}
+  即排除被其他叶子的 cone 包含的叶子。
+
+  UB3 ≤ UB1（去掉了被包含叶子的贡献）。
+
+计算代价：
+  判断 l_j ∈ S(l_i) 等价于判断 l_j 是否在 l_i 的 CutBest cone 的
+  MFFC 递归展开中出现。这可以在预计算 |S(l)| 时顺便记录：
+  在 Deref 的 DFS 过程中，标记每个被访问节点的"被哪个顶层叶子覆盖"。
+
+  对于 K-LUT mapping (K ≤ 6~8)，cut 叶子数最多 K 个，
+  L_indep 的计算是 O(K²) 的检查。
+
+---------- 3.4 UB-4: MFFC 大小上界 (MFFC Size Bound) ----------
+
+  UB4(C) = LutArea(C) + |M|
+
+  即无论 cut 如何选择，激活的节点数不超过整个 MFFC 的大小。
+
+  这个上界与 cut 无关，所以不能用于比较 cut 之间的优劣。
+  但当 |M| 本身很小（例如 |M| ≤ 2）时，说明所有 cut 的 exact area
+  差异很小，可以考虑直接跳过精确计算（用 area-flow 结果）。
+
+
+================================================================================
+第四章  下界设计
+================================================================================
+
+---------- 4.1 LB-1: 叶子计数下界 (Leaf Count Bound) ----------
+
+  LB1(C) = LutArea(C) + |{l ∈ L(C) : l ∈ M}|
+
+  即每个 nRefs=0 的 AND 叶子至少贡献 1 个 LUT（它自己）。
+
+正确性证明：
+  对于 l ∈ M，l ∈ S(l)（S(l) 至少包含 l 自身）。
+  不同的 l 产生不同的元素（l_i ≠ l_j → l_i ∉ {l_j}）。
+  注意这里有个微妙之处：l_i ∈ S(l_j) 是可能的（当 l_i 在 l_j 的
+  cone 中时），但 l_i 本身作为 ⋃ 的一个元素，只要 l_i ∈ S(l_i)，
+  它就一定在并集中。
+
+  更严格地：
+  ⋃_{l ∈ L∩M} S(l) ⊇ {l : l ∈ L∩M}（每个叶子至少贡献自身）
+  → |⋃ S(l)| ≥ |L ∩ M|
+  → ExactArea(C) ≥ LutArea(C) + |L ∩ M|                            □
+
+---------- 4.2 LB-2: 最大单例下界 (Max Singleton Bound) ----------
+
+  LB2(C) = LutArea(C) + max_{l ∈ L(C) ∩ M} |S(l)|
+
+  若 L(C) ∩ M = ∅，则 LB2(C) = LutArea(C)。
+
+正确性证明：
+  对任意 l* ∈ L(C) ∩ M：
+  ⋃_{l ∈ L(C)} S(l) ⊇ S(l*)
+  → f(L) ≥ |S(l*)|
+  → f(L) ≥ max |S(l)|                                              □
+
+直观含义：
+  精确面积至少要实现最大的那个叶子的整个 cone，
+  即使其他叶子的 cone 与它完全重叠。
+
+---------- 4.3 LB-3: 互补下界 (Complementary Bound) ----------
+
+选择 l* = argmax_{l ∈ L(C)∩M} |S(l)|，定义：
+
+  L_ext(C) = {l ∈ L(C) ∩ M : l ≠ l* 且 l ∉ S(l*)}
+
+即不在 l* 的 cone 中的其他 MFFC 叶子。
+
+  LB3(C) = LutArea(C) + |S(l*)| + |L_ext(C)|
+
+正确性证明：
+  ⋃ S(l) ⊇ S(l*) ∪ {l : l ∈ L_ext(C)}
+
+  对于 l ∈ L_ext(C)：l ∉ S(l*)（因为 l ∉ S(l*)），且 l ∈ S(l)，
+  所以 l ∈ (⋃ S(l)) \ S(l*)。
+
+  因此 |⋃ S(l)| ≥ |S(l*)| + |L_ext(C)|                            □
+
+  LB3 ≥ LB2（因为 |L_ext| ≥ 0）。
+  LB3 ≥ LB1（当 |S(l*)| ≥ 1 时，|S(l*)| + |L_ext| ≥ |L∩M|，
+              因为 L∩M = {l*} ∪ (L∩M∩S(l*)) ∪ L_ext，
+              而 |S(l*)| ≥ 1 ≥ |{l*}|，
+              且 L∩M∩S(l*) 中的叶子虽然不在 L_ext 中，
+              但它们在 S(l*) 中，所以被 |S(l*)| 覆盖。）
+
+---------- 4.4 LB-4: 递归下界 (Recursive Bound) ----------
+
+可以将 LB-3 递归应用于 L_ext(C)：
+
+  在 L_ext(C) 中选择 l** = argmax |S(l)|，再定义 L_ext2...
+
+  LB4(C) = LutArea(C) + |S(l*)| + |S(l**)| + |L_ext2(C)|
+
+  其中 L_ext2(C) = {l ∈ L_ext(C) : l ≠ l** 且 l ∉ S(l**)}
+
+  这本质上是"贪心下界"：每次选最大的 cone，排除已覆盖的叶子，
+  然后对剩余叶子重复。
+
+  正确性：每步都在 ⋃ 中加入不重叠的部分。
+
+  终止条件：当 L_ext 为空时停止。
+
+  复杂度：最多递归 K 次（K = LUT 输入数上限），每次 O(K) 检查。
+  总代价 O(K²)，远小于完整 DFS。
+
+---------- 4.5 下界比较 ----------
+
+  LB4 ≥ LB3 ≥ max(LB1, LB2)
+
+  LB4 在叶子的 cone 高度不相交的部分越多时越紧。
+  在极端情况（所有 S(l) 两两不相交）下，LB4 = ExactArea（精确）。
+
+
+================================================================================
+第五章  问题特性与推论
+================================================================================
+
+---------- 5.1 MFFC DAG 结构对 cone 重叠的约束 ----------
+
+关键观察：S(l_i) ∩ S(l_j) ≠ ∅ 只在以下情况发生：
+
+  存在节点 v ∈ M，使得 v 同时可从 l_i 和 l_j 的 CutBest cone
+  递归到达（仅经过 nRefs=0 的 AND 节点）。
+
+这意味着 MFFC DAG 中必须存在 **重汇路径 (reconvergent path)**：
+从 n 到 v 存在两条不同的路径，分别经过 l_i 和 l_j。
+
+推论 5.1 (树形 MFFC):
+  如果 MFFC DAG 是树结构（无重汇），则所有 S(l) 两两不相交，
+  f 是模函数（可加），UB1 = LB4 = ExactArea。
+  → 无需任何精确 ref/deref 计算。
+
+推论 5.2 (稀疏重汇):
+  重汇越少，cone 重叠越小，上下界之间的 gap 越小，
+  剪枝效果越好。
+
+推论 5.3 (深度约束):
+  |S(l)| ≤ 2^{depth(l, MFFC)} - 1
+  其中 depth(l, MFFC) 是 l 在 MFFC DAG 中到最深处的距离。
+  这是因为 MFFC 是二叉 DAG（每个 AND 节点有 2 个 fanin）。
+  在树形情况下取等号。
+
+---------- 5.2 候选 cut 的结构性质 ----------
+
+候选 cut 的叶子集 L(C) 是由 x 的某个 cut 和 y 的某个 cut merge 得到。
+设 L(C) = L_x ∪ L_y（可能有交集 L_x ∩ L_y）。
+
+性质 5.4 (Merge 结构):
+  如果 L_x 中的叶子全部在 x 的子 DAG 中，L_y 中的叶子全部在 y 的
+  子 DAG 中，且 x 和 y 的子 DAG 不重叠（即无重汇），则：
+
+  S(l_x) ∩ S(l_y) = ∅  对于 l_x ∈ L_x, l_y ∈ L_y
+
+  此时 f(L) = f(L_x) + f(L_y)，面积可以分解为两个独立子问题。
+
+性质 5.5 (共享叶子):
+  如果 l ∈ L_x ∩ L_y（同一个叶子同时出现在 x-cut 和 y-cut 中），
+  则 l 在并集中只被计算一次。这在 merge 操作中自然去重。
+
+---------- 5.3 曲率 (Curvature) 分析 ----------
+
+子模函数的曲率 κ 定义为：
+
+  κ = 1 - min_{l ∈ L(C)∩M} [f(L(C)) - f(L(C)\{l})] / f({l})
+
+  = 1 - min_l [边际贡献 of l given all others] / [独立贡献 of l]
+
+曲率 κ ∈ [0, 1]:
+  - κ = 0: f 是模函数（可加），无重叠，UB1 = ExactArea
+  - κ = 1: 最大重叠，某个叶子的独立贡献完全被其他叶子覆盖
+
+推论 5.6:
+  上界的松弛程度由曲率控制：
+    UB1(C) - ExactArea(C) ≤ κ · Σ |S(l)|
+
+  直观理解：κ 越大（重叠越多），独立求和的误差越大。
+
+推论 5.7 (自适应策略):
+  如果能在 O(1) 或 O(K) 时间内估计 MFFC 的曲率：
+  - κ ≈ 0: 直接用 UB1 作为 ExactArea 的近似（误差很小），
+            或者直接用 UB1=LB4 剪枝（gap 很小，几乎所有 cut 可剪枝）
+  - κ ≈ 1: 上下界 gap 大，剪枝效果差，直接做精确计算
+
+  曲率的快速估计方法：
+    统计 MFFC DAG 中的重汇扇出节点数 / 总节点数
+    重汇越多 → κ 越大
+
+---------- 5.4 cut 间的支配关系 ----------
+
+定义：cut C_1 支配 cut C_2 (C_1 ≻ C_2) 当且仅当
+  ExactArea(C_1) ≤ ExactArea(C_2)
+
+利用上下界可以在不做精确计算的情况下判断支配关系：
+
+  UB(C_1) < LB(C_2) → C_1 ≻ C_2  （C_2 一定不是最优，可剪枝）
+
+这个支配关系是剪枝的核心：如果当前最优 cut 的上界小于某候选 cut 的
+下界，该候选 cut 可以被安全剪枝。
+
+
+================================================================================
+第六章  剪枝算法设计
+================================================================================
+
+---------- 6.1 预计算阶段 ----------
+
+在 Deref(CutBest(n)) 的过程中，利用 DFS 的返回值自然记录每个叶子的
+激活集大小。
+
+修改 If_CutAreaDeref 的行为（或新增一个变体函数）：
+
+  DerefAndRecord(pCut):
+    Area = LutArea(pCut)
+    for each leaf l in pCut:
+      assert(l->nRefs > 0)
+      --l->nRefs
+      if (l->nRefs > 0 || !IsAnd(l)):
+        mffcSize[l->Id] = 0          // 外部节点，激活集为空
+        continue
+      mffcSize[l->Id] = DerefAndRecord(CutBest(l))
+                                      // 递归返回值 = |S(l)|
+      Area += mffcSize[l->Id]
+    return Area
+
+  注意：mffcSize[l->Id] 记录的是"以 l 为根的 MFFC 子树大小"，
+  即 |S(l)| = LutArea(CutBest(l)) + 递归部分。
+
+  对于 l ∈ E（nRefs 仍 > 0），mffcSize[l->Id] = 0。
+
+  预计算代价：与原始 Deref 相同，O(|MFFC|)，无额外开销。
+
+进一步记录（可选）：
+  - 对每个 MFFC 节点 v，记录它"属于哪些叶子的 S 集合"
+    （用于计算 UB-3 的包含关系和 LB-3/LB-4 的 L_ext）
+  - 但这需要额外的标记数组，可能在实现中需要权衡
+
+---------- 6.2 快速评估阶段 ----------
+
+对每个候选 cut C，按以下顺序计算：
+
+  Step A: 计算 LB1 (O(K))
+    lb1 = LutArea(C) + count(l ∈ L(C) : l ∈ M)
+    if (lb1 >= best_area):
+      剪枝，跳过
+
+  Step B: 计算 UB1 (O(K))
+    ub1 = LutArea(C) + Σ_{l ∈ L(C)} mffcSize[l->Id]
+    if (ub1 < best_area):
+      更新 best_area = ub1  // UB1 是上界，但也可以作为"乐观估计"
+      记录 best_cut_candidate = C
+      注意：此时 best_area 是上界，不是精确值！
+            需要在最后对 best_cut_candidate 做一次精确计算确认。
+
+      更严谨的做法：ub1 只用于剪枝其他 cut，不直接更新 best_area。
+      best_area 始终保持精确值。
+
+  Step C: 计算 LB2 (O(K))
+    lb2 = LutArea(C) + max_{l ∈ L(C)∩M} mffcSize[l->Id]
+    if (lb2 >= best_area):
+      剪枝，跳过
+
+  Step D (可选): 计算 LB3 或 LB4 (O(K²))
+    需要知道叶子间的包含关系（l_j ∈ S(l_i)?）。
+    如果在预计算阶段记录了这些信息，可以 O(K²) 计算。
+    lb3 = ... (按第四章 4.3 节计算)
+    if (lb3 >= best_area):
+      剪枝，跳过
+
+  Step E: 精确计算 (O(|MFFC|))
+    exact_area = If_CutAreaDerefed(C)
+    if (exact_area < best_area):
+      best_area = exact_area
+      best_cut = C
+
+---------- 6.3 算法正确性 ----------
+
+定理 6.1: 上述剪枝算法输出的 best_cut 与不做剪枝的原始算法完全一致。
+
+证明：
+  剪枝只发生在 LB(C) ≥ best_area 时。
+  由下界性质，ExactArea(C) ≥ LB(C) ≥ best_area。
+  因此 C 不可能是更优的 cut，安全跳过。
+
+  best_area 只在 Step E 中用精确值更新，保证其准确性。
+
+  UB 仅用于将 best_area 与 LB 比较时提供参考（例如，
+  可以先对所有 cut 计算 UB，用最小的 UB 初始化 best_area 的候选，
+  然后再精确计算该候选以确认。但为了正确性，最终必须精确确认。） □
+
+---------- 6.4 优化：评估顺序 ----------
+
+剪枝效率取决于 best_area 收敛的速度——越早找到好的 cut，
+后续剪枝越多。
+
+策略：按 UB1 从小到大排序候选 cut，先评估最有可能是最优的 cut。
+
+  // 预处理
+  for each cut C_i:
+    ub1[i] = LutArea(C_i) + Σ mffcSize[l]
+  sort cuts by ub1 ascending
+
+  // 评估
+  for each cut C_i in sorted order:
+    if (LB(C_i) >= best_area): continue
+    exact = If_CutAreaDerefed(C_i)
+    if (exact < best_area):
+      best_area = exact
+      best_cut = C_i
+
+这样第一个评估的 cut 大概率给出一个很好的 best_area，
+使得后续大量 cut 被 LB 剪枝。
+
+---------- 6.5 特殊情况的快速路径 ----------
+
+Fast Path 1: |M| = 0 (MFFC 为空)
+  所有叶子都在 E 中，所有 cut 的 f(L) = 0。
+  ExactArea(C) = LutArea(C)，直接按 LutArea 选最小的 cut。
+  → 完全跳过 ref/deref
+
+Fast Path 2: |M| ≤ 1 (MFFC 只有 0 或 1 个节点)
+  f(L) ∈ {0, 1}，取决于 cut 叶子是否包含该 MFFC 节点。
+  → O(K) 可判断，无需 DFS
+
+Fast Path 3: 所有 S(l) 两两不相交 (无重汇，f 是模函数)
+  UB1 = ExactArea，直接用 UB1 作为精确值。
+  判断条件：Σ |S(l)| = |M| 对于包含所有 MFFC 叶子的 cut。
+  更快的判断：MFFC DAG 是否为树。
+  → 完全跳过 ref/deref
+
+Fast Path 4: UB1(C_best_candidate) = LB(C_best_candidate)
+  如果某个 cut 的上下界相等，该 cut 的面积已确定，
+  如果它已经是目前最优，可以提前终止。
+
+---------- 6.6 实现要点 ----------
+
+(a) mffcSize 数组：
+  可以复用 If_Man_t 中已有的临时数组（如 pObj->pCopy 或额外的 float），
+  或者在栈上分配一个 K 层深度的小数组（MFFC 深度通常 ≤ K）。
+
+  实际上，由于 MFFC 节点的 ID 可能分散，更实用的方式是：
+  在 Deref 过程中，将 mffcSize 存入节点本身的某个临时字段
+  （如 pLeaf->dTemp 或新增字段）。
+
+(b) 下界中的"l ∈ M"判断：
+  等价于 l.nRefs == 0 && IsAnd(l)，在 deref 后直接可读。
+
+(c) 包含关系判断 (用于 LB-3/4 和 UB-3)：
+  "l_j ∈ S(l_i)?" 需要在 Deref 时额外标记。
+  一种轻量方案：在 Deref 的 DFS 中，为每个节点记录它的"最近 MFFC 根"
+  （即是从哪个叶子的 DFS 到达的），但这在有重汇时不唯一。
+
+  更稳健方案：只对 K 个叶子之间两两检查，
+  l_j ∈ S(l_i) 等价于 l_j 在 l_i 的 CutBest cone 中且 nRefs(l_j)=0。
+  可以通过检查 l_j 的 ID 是否在 l_i 的 CutBest 的递归展开中出现。
+  但这又是一个 DFS，代价与精确计算相当。
+
+  折中方案：只用 LB1 和 LB2（O(K) 代价），不使用需要包含关系的 LB3/4。
+  在实践中 LB1 + LB2 + UB1 的组合通常已经足够高效。
+
+
+================================================================================
+第七章  理论分析：剪枝效率
+================================================================================
+
+---------- 7.1 gap 分析 ----------
+
+定义 gap(C) = UB1(C) - LB2(C)
+           = Σ |S(l)| - max |S(l)|
+           = Σ_{l ≠ l*} |S(l)|    (l* 是最大的)
+
+gap 衡量上下界的松弛程度。gap 越小，剪枝越有效。
+
+  - 如果一个候选 cut 只有 1 个 MFFC 叶子: gap = 0，上下界精确
+  - 如果所有 MFFC 叶子的 |S(l)| 都很小 (≈1): gap ≈ K-1
+  - 如果存在一个 dominant 叶子 (|S(l*)| >> 其他): gap ≈ Σ_{l≠l*} |S(l)| 很小
+
+---------- 7.2 剪枝率估计 ----------
+
+假设有 M 个候选 cut，真实最优面积为 OPT。
+一个候选 cut C 被剪枝的充分条件是 LB(C) ≥ OPT。
+
+  用 LB1: 被剪枝当且仅当 LutArea(C) + |L(C)∩M| ≥ OPT
+  → 排除 MFFC 叶子数过多的 cut
+
+  用 LB2: 被剪枝当且仅当 LutArea(C) + max |S(l)| ≥ OPT
+  → 排除含有大 MFFC 子树的 cut
+
+  用 UB1 初始化 best_area: 如果第一个评估的 cut 有 ub1 ≈ OPT，
+  则后续大部分 cut 可被 LB 剪枝。
+
+---------- 7.3 与 area-flow 的关系 ----------
+
+在 Mode=1 (area-flow) 中使用的面积估计：
+
+  AreaFlow(C) = LutArea(C) + Σ_{l ∈ L(C)} AreaFlow(CutBest(l)) / EstRefs(l)
+
+这实际上是一个"带折扣的独立和"，通过 EstRefs 分摊共享。
+
+与子模上界 UB1 的对比：
+  - AreaFlow 通过 /EstRefs 来近似处理共享（用全局统计信息）
+  - UB1 用 |S(l)| 来精确计算"假设完全不共享"时的代价
+  - AreaFlow 可能高估也可能低估（取决于 EstRefs 的准确性）
+  - UB1 保证是上界
+
+理论启示：area-flow 可以看作子模函数的一种"平均化松弛"，
+而 exact area 是子模函数的精确求值。两者之间的关系可以
+通过子模函数的 Lovász 扩展来理解。
+
+
+================================================================================
+第八章  总结与实现路线图
+================================================================================
+
+---------- 8.1 推荐的实现优先级 ----------
+
+  Phase 1 (低代价，高收益):
+    - 在 Deref 时记录 mffcSize[l]（修改 If_CutAreaDeref）
+    - 实现 LB1 和 UB1 的 O(K) 评估
+    - 在 If_CutAreaDerefed 调用前加入 LB1/UB1 剪枝
+    - 实现 Fast Path 1/2/3
+
+  Phase 2 (中等代价，中等收益):
+    - 实现 LB2 (max singleton)
+    - 实现按 UB1 排序的评估顺序
+    - 加入曲率估计，对低曲率 MFFC 跳过精确计算
+
+  Phase 3 (高代价，理论价值):
+    - 实现 LB3/4 (需要包含关系)
+    - 实现 UB3 (包含消除)
+    - 探索增量计算 (基于 cut 间的差异)
+
+---------- 8.2 正确性保证 ----------
+
+核心原则：best_area 只由 If_CutAreaDerefed 的返回值更新（Step E），
+所有上下界仅用于跳过不可能最优的候选 cut。因此算法输出与原始算法
+完全一致，是 exact 优化（非近似）。
+
+---------- 8.3 理论贡献点 ----------
+
+  (1) 将 FPGA exact area recovery 建模为 coverage function 最小化
+  (2) 证明子模性，导出上下界族
+  (3) 通过曲率分析给出剪枝效率的定量刻画
+  (4) 树形 MFFC 的模函数特殊情况：O(K) 精确计算
+  (5) 将 area-flow 解释为子模函数的 Lovász 松弛（统一理论框架）
+
+
+================================================================================
+附录 A  关键公式速查
+================================================================================
+
+  ExactArea(C) = LutArea(C) + |⋃_{l ∈ L(C)} S(l)|
+
+  UB1(C) = LutArea(C) + Σ_{l ∈ L(C)} |S(l)|
+  UB3(C) = LutArea(C) + Σ_{l ∈ L_indep(C)} |S(l)|
+
+  LB1(C) = LutArea(C) + |L(C) ∩ M|
+  LB2(C) = LutArea(C) + max_{l ∈ L(C)∩M} |S(l)|
+  LB3(C) = LutArea(C) + |S(l*)| + |L_ext(C)|
+  LB4(C) = LB3 的递归版本（贪心下界）
+
+  关系: LB1 ≤ LB2 ≤ LB3 ≤ LB4 ≤ ExactArea ≤ UB3 ≤ UB1
+
+  特殊情况: 当 f 是模函数时, LB4 = UB1 = ExactArea
+
+
+================================================================================
+附录 B  反例：UB1 与 ExactArea 的差异
+================================================================================
+
+AIG 结构 (deref 后):
+
+      N
+     / \
+    X   Y       nRefs: X=0, Y=0
+   / \ / \
+  A   S   B     nRefs: S=0, A>0, B>0 (A,B 是 PI 或外部引用)
+
+  CutBest(X) = {A, S}
+  CutBest(Y) = {S, B}
+
+激活集:
+  S(X) = {X, S}    (ref X: X 从 0→1, 递归 {A,S}, S 从 0→1)
+  S(Y) = {Y, S}    (ref Y: Y 从 0→1, 递归 {S,B}, S 从 0→1)
+
+候选 cut: C = {X, Y}
+
+  UB1(C) = 1 + |S(X)| + |S(Y)| = 1 + 2 + 2 = 5
+  ExactArea(C) = 1 + |S(X) ∪ S(Y)| = 1 + |{X, S, Y}| = 1 + 3 = 4
+
+  差异 = 1 (S 被重复计数一次)
+
+  LB1(C) = 1 + 2 = 3
+  LB2(C) = 1 + max(2, 2) = 3
+
+  剪枝能力：如果另一个 cut C' 的 LB ≥ 4 = ExactArea(C)，C' 可被剪枝。
+
+

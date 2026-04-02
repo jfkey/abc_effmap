@@ -1,0 +1,191 @@
+================================================================================
+              MFFC (Maximum Fanout-Free Cone) 详解
+================================================================================
+参考代码: src/aig/aig/aigMffc.c, src/map/mapper/mapperRefs.c
+
+================================================================================
+1. 定义
+================================================================================
+
+MFFC（Maximum Fanout-Free Cone）是针对一个节点 n 定义的：
+
+  节点 n 的 MFFC 是从 n 出发沿着 fan-in 方向能到达的最大的节点集合，
+  其中集合内的每个节点（除了 n 本身）的所有 fan-out 都在该集合内部。
+
+换句话说：
+  - 从节点 n 开始，向输入方向（fan-in 方向）回溯
+  - 如果一个节点的所有 fan-out 都最终汇聚到 n（即它不被 n 的 cone
+    之外的任何节点使用），则它属于 n 的 MFFC
+  - 一旦遇到一个节点有 fan-out 指向 n 的 cone 之外，停止在该方向的扩展
+
+示意图：
+
+        n (root)
+       / \
+      a   b        <-- 如果 a 只被 n 使用 (fanout=1)，a 属于 MFFC
+     / \   \       <-- 如果 b 还被别的节点使用 (fanout>1)，b 是 MFFC 的边界
+    c   d   e
+
+  假设 a 的 fanout 只有 n，c 和 d 的 fanout 只有 a：
+  MFFC(n) = {n, a, c, d}
+  b 是边界（b 还有其他 fanout），e 是边界
+
+
+================================================================================
+2. "Fanout-Free" 的含义
+================================================================================
+
+"Fanout-Free" 指的是锥体内的节点（除了根节点 n）没有"自由的" fan-out
+——它们的所有输出都被锥体内部消耗掉了。也就是说，这些节点仅为 n 服务，
+不被电路的其他部分使用。
+
+关键区分：
+  - 根节点 n 可以有任意多个 fanout（MFFC 是对 n 定义的）
+  - MFFC 内部的其他节点，其 fanout 必须全部在 MFFC 内
+  - MFFC 的边界节点：有 fanout 指向 MFFC 外部的节点
+
+
+================================================================================
+3. 如何计算 MFFC
+================================================================================
+
+核心思想：利用引用计数（reference count / nRefs）来判断一个节点是否
+"只为 n 服务"。
+
+算法（基于 Deref/Ref 对称操作）：
+
+  MFFC_Size(n):
+    1. 对 n 的每个 fan-in 节点 c：
+       a. 将 c 的引用计数减 1（--nRefs，模拟"移除 n 对 c 的依赖"）
+       b. 如果 c 的引用计数变为 0（说明 c 的所有 fan-out 都在 MFFC 中）：
+          - 计数器 +1（c 属于 MFFC 内部）
+          - 递归地对 c 的 fan-in 重复步骤 a-b
+       c. 如果 c 的引用计数 > 0（说明 c 还有 MFFC 之外的 fan-out）：
+          - 不扩展，c 是 MFFC 的边界
+    2. 恢复所有引用计数（通过 Ref 操作）
+    3. 返回计数器值 = MFFC 大小（内部节点数）
+
+直觉：从 n 出发，把"只为 n 服务"的节点全部纳入锥体，直到碰到
+"还被别人使用"的节点为止。
+
+---------- 代码对应 (aigMffc.c) ----------
+
+Aig_NodeDeref_rec() [行 45-73]:
+  递归 dereference，对每个 fanin 执行 --nRefs：
+
+    pFanin = Aig_ObjFanin0(pNode);
+    assert( pFanin->nRefs > 0 );
+    if ( --pFanin->nRefs == 0 && ... )          // nRefs 降到 0 → 属于 MFFC
+        Counter += Aig_NodeDeref_rec( pFanin );  // 递归展开
+    // 同样处理 Fanin1
+    return Counter + 1;  // +1 计算当前节点
+
+Aig_NodeRef_rec() [行 86-105]:
+  对称的 reference 操作，递归 ++nRefs：
+
+    pFanin = Aig_ObjFanin0(pNode);
+    if ( pFanin->nRefs++ == 0 && ... )           // nRefs 从 0 恢复
+        Counter += Aig_NodeRef_rec( pFanin );    // 递归恢复
+    return Counter + 1;
+
+Aig_NodeMffcSupp() [行 179-198]:
+  计算 MFFC 大小并收集边界支撑节点：
+
+    ConeSize1 = Aig_NodeDeref_rec( pNode );  // deref → 暴露 MFFC
+    Aig_NodeMffcSupp_rec( ... );              // 收集 MFFC 内部和边界
+    ConeSize2 = Aig_NodeRef_rec( pNode );    // ref → 恢复引用计数
+    assert( ConeSize1 == ConeSize2 );        // 对称性校验
+
+关键不变量：Deref 和 Ref 是完全对称的操作，
+  Deref 返回的节点数 == Ref 返回的节点数。
+  这保证了引用计数被完整恢复，不会留下副作用。
+
+---------- 在 Mapper 中的 MFFC (mapperRefs.c) ----------
+
+Map_CutRefDeref() [行 229-322]:
+  与 AIG 层的 Deref/Ref 思想相同，但工作在 mapping 后的 circuit 上：
+  - 沿着 best cut 的叶子节点递归
+  - 递减/递增 nRefAct[]（实际引用计数）
+  - 当 nRefAct 降到 0 时递归展开（= MFFC 内部节点）
+  - 返回值是面积而非节点计数
+
+  区别：
+  - AIG 层的 Deref/Ref 在原始 AIG 图上操作，返回节点数
+  - Mapper 层的 Deref/Ref 在 mapping 后的 cut 结构上操作，返回面积
+  - Mapper 层需要处理相位（正/负相位）和 inverter 面积
+
+
+================================================================================
+4. MFFC 的物理含义
+================================================================================
+
+MFFC 中的节点（除了根 n 和 PI）是"如果 n 被移除，也可以被移除"的节点。
+
+因为它们的所有 fan-out 都汇聚到 n，没有其他用户。如果 n 不存在了
+（例如被重新映射到不同的 cut），MFFC 中的这些节点也变成了死代码
+（dead logic）。
+
+具体来说：
+  - MFFC 的大小 = 移除节点 n 后可以连带移除的内部节点数
+  - 这些节点是 n 的"专属资源"
+  - 它们的面积可以被"回收"
+
+这个性质在 technology mapping 的 area recovery 阶段至关重要：
+  - 当考虑用新 cut 替换旧 cut 时
+  - 旧 cut 的 MFFC 面积 = 可以释放的面积
+  - 新 cut 需要的独占面积 = 需要新增的面积
+  - 净收益 = 旧 MFFC 面积 - 新 cut 独占面积
+
+
+================================================================================
+5. MFFC 的应用场景
+================================================================================
+
+(a) Area Recovery (面积恢复)
+    在 technology mapping 中，exact area 的计算直接依赖于 MFFC：
+    - Deref 旧 cut → 释放其 MFFC → 计算释放面积
+    - Ref 新 cut → 计算新 cut 的独占面积
+    - 选择净面积最小的 cut
+
+(b) Logic Resynthesis (逻辑重综合)
+    MFFC 定义了一个节点可以被安全替换的范围：
+    - MFFC 内的逻辑可以被完全重写
+    - MFFC 的边界（支撑节点）是重写的输入
+
+(c) Node Importance Estimation (节点重要性估计)
+    MFFC 大小反映了一个节点的"影响范围"：
+    - MFFC 大的节点影响范围大，优化潜力大
+    - MFFC 小的节点（叶子附近）影响有限
+
+(d) Redundancy Removal (冗余移除)
+    如果一个节点被证明冗余并移除，其 MFFC 中的节点也可以被移除。
+
+
+================================================================================
+6. LevelMin 参数的作用
+================================================================================
+
+在 Aig_NodeDeref_rec 中有一个 LevelMin 参数：
+
+    if ( --pFanin->nRefs == 0 && (!LevelMin || pFanin->Level > LevelMin) )
+
+这允许限制 MFFC 的深度：
+  - LevelMin = 0：不限制，计算完整 MFFC
+  - LevelMin > 0：只展开 Level > LevelMin 的节点
+
+这在深度受限的 resynthesis 中有用，避免 MFFC 过大导致重综合耗时。
+
+
+================================================================================
+7. 总结
+================================================================================
+
+  概念        | 说明
+  ------------|------------------------------------------
+  MFFC        | 节点 n 的最大无扇出锥体
+  内部节点    | fanout 全在 MFFC 内（nRefs deref 后 = 0）
+  边界节点    | fanout 有指向 MFFC 外的（nRefs deref 后 > 0）
+  计算方法    | Deref/Ref 对称操作
+  物理含义    | 移除 n 后可连带移除的节点集
+  核心应用    | Area recovery 中的 exact area 计算
+  代码位置    | aigMffc.c (AIG层), mapperRefs.c (Mapper层)

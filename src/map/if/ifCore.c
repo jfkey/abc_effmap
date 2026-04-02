@@ -22,6 +22,10 @@
 
 ABC_NAMESPACE_IMPL_START
 
+// profiling functions from ifCut.c
+extern void If_CutAreaRefDerefProfilePrint( char * pStageName );
+extern void If_CutAreaRefDerefProfileReset();
+
 
 ////////////////////////////////////////////////////////////////////////
 ///                        DECLARATIONS                              ///
@@ -144,14 +148,18 @@ int If_ManPerformMappingComb( If_Man_t * p )
         If_ManImproveMapping( p );
 
     // area flow oriented mapping
+    If_CutAreaRefDerefProfileReset();
     for ( i = 0; i < p->pPars->nFlowIters; i++ )
     {
         If_ManPerformMappingRound( p, p->pPars->nCutsMax, 1, 0, 0, "Flow" );
         if ( p->pPars->fExpRed )
             If_ManImproveMapping( p );
     }
+    If_CutAreaRefDerefProfilePrint( "AreaFlow" );
 
     // area oriented mapping
+    If_CutAreaRefDerefProfileReset();
+    If_CutAreaPruningStatsReset( p );
     for ( i = 0; i < p->pPars->nAreaIters; i++ )
     {
         if ( p->pPars->fDumpFile && p->pPars->nLutSize <= 6 && i == p->pPars->nAreaIters-1 ) {
@@ -162,6 +170,8 @@ int If_ManPerformMappingComb( If_Man_t * p )
         if ( p->pPars->fExpRed )
             If_ManImproveMapping( p );
     }
+    If_CutAreaRefDerefProfilePrint( "ExactArea" );
+    If_CutAreaPruningStatsPrint( p );
 
     if ( p->pPars->fVerbose )
     {

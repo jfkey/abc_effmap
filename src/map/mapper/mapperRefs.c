@@ -25,6 +25,14 @@ ABC_NAMESPACE_IMPL_START
 ///                        DECLARATIONS                              ///
 ////////////////////////////////////////////////////////////////////////
 
+// Profiling variables for Map_CutRefDeref
+static int    s_MapRD_Depth      = 0;       // current recursion depth
+static int    s_MapRD_CurSize    = 0;       // MFFC size of current top-level call
+static int    s_MapRD_MaxSize    = 0;       // max MFFC size across all calls
+static ABC_INT64_T s_MapRD_TotalSize  = 0;  // sum of all MFFC sizes
+static ABC_INT64_T s_MapRD_CallCount  = 0;  // number of top-level calls
+static abctime     s_MapRD_TotalTime  = 0;  // total time in Map_CutRefDeref
+
 ////////////////////////////////////////////////////////////////////////
 ///                     FUNCTION DEFINITIONS                         ///
 ////////////////////////////////////////////////////////////////////////
@@ -232,11 +240,34 @@ float Map_CutRefDeref( Map_Cut_t * pCut, int fPhase, int fReference, int fUpdate
     Map_Cut_t * pCutChild;
     float aArea;
     int i, fPhaseChild;
+    int fTopLevel = (s_MapRD_Depth == 0);
+    abctime clkStart = 0;
 //    int nRefs;
+
+    // profiling: top-level call setup
+    if ( fTopLevel )
+    {
+        s_MapRD_CurSize = 0;
+        clkStart = Abc_Clock();
+    }
+    s_MapRD_Depth++;
+    s_MapRD_CurSize++;
 
     // consider the elementary variable
     if ( pCut->nLeaves == 1 )
+    {
+        // profiling: top-level call teardown
+        s_MapRD_Depth--;
+        if ( fTopLevel )
+        {
+            s_MapRD_TotalTime += Abc_Clock() - clkStart;
+            s_MapRD_CallCount++;
+            s_MapRD_TotalSize += s_MapRD_CurSize;
+            if ( s_MapRD_CurSize > s_MapRD_MaxSize )
+                s_MapRD_MaxSize = s_MapRD_CurSize;
+        }
         return 0;
+    }
     // start the area of this cut
     aArea = Map_CutGetRootArea( pCut, fPhase );
     if ( fUpdateProf )
@@ -317,6 +348,16 @@ float Map_CutRefDeref( Map_Cut_t * pCut, int fPhase, int fReference, int fUpdate
         }
         // reference and compute area recursively
         aArea += Map_CutRefDeref( pCutChild, fPhaseChild, fReference, fUpdateProf );
+    }
+    // profiling: top-level call teardown
+    s_MapRD_Depth--;
+    if ( fTopLevel )
+    {
+        s_MapRD_TotalTime += Abc_Clock() - clkStart;
+        s_MapRD_CallCount++;
+        s_MapRD_TotalSize += s_MapRD_CurSize;
+        if ( s_MapRD_CurSize > s_MapRD_MaxSize )
+            s_MapRD_MaxSize = s_MapRD_CurSize;
     }
     return aArea;
 }
@@ -530,6 +571,42 @@ float Map_MappingGetArea( Map_Man_t * pMan )
     return Area;
 }
 
+
+/**function*************************************************************
+
+  synopsis    [Prints and resets Map_CutRefDeref profiling statistics.]
+
+  description []
+
+  sideeffects []
+
+  seealso     []
+
+***********************************************************************/
+void Map_CutRefDerefProfilePrint( char * pStageName )
+{
+    if ( s_MapRD_CallCount > 0 )
+    {
+        printf( "ASIC Map_CutRefDeref profiling [%s]:\n", pStageName );
+        printf( "  Total time         : %10.2f sec\n",
+            (double)s_MapRD_TotalTime / CLOCKS_PER_SEC );
+        printf( "  Top-level calls    : %lld\n", (long long)s_MapRD_CallCount );
+        printf( "  Max MFFC size      : %d  (nodes visited in single DFS)\n",
+            s_MapRD_MaxSize );
+        printf( "  Average MFFC size  : %.2f\n",
+            (double)s_MapRD_TotalSize / s_MapRD_CallCount );
+        printf( "  Total nodes visited: %lld\n", (long long)s_MapRD_TotalSize );
+    }
+}
+void Map_CutRefDerefProfileReset()
+{
+    s_MapRD_Depth     = 0;
+    s_MapRD_CurSize   = 0;
+    s_MapRD_MaxSize   = 0;
+    s_MapRD_TotalSize = 0;
+    s_MapRD_CallCount = 0;
+    s_MapRD_TotalTime = 0;
+}
 
 ////////////////////////////////////////////////////////////////////////
 ///                       END OF FILE                                ///

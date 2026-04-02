@@ -1,0 +1,628 @@
+================================================================================
+   ASIC Mapping Exact Area 性能瓶颈优化分析 & 增量图计算引入可行性
+================================================================================
+参考代码: src/map/mapper/mapperMatch.c, mapperRefs.c, mapperCore.c
+参考论文: BoundLS (Bounded Dynamic Level Maintenance for Efficient Logic Optimization)
+参考资料: intro_exact_area.txt, intro_exact_area_compare.txt
+
+日期: 2026-04-01
+
+================================================================================
+目录
+================================================================================
+  第一部分: 性能瓶颈根因再分析
+  第二部分: 优化方向总览
+  第三部分: 方向 A — Root Area 分离 + Phase-Pattern 分组 (精确优化)
+  第四部分: 方向 B — Dirty-Flag 跳过未变化节点 (增量思想)
+  第五部分: 方向 C — 增量 MFFC 维护 (BoundLS 思想迁移)
+  第六部分: BoundLS 与 ASIC Mapping 的深度对比
+  第七部分: 切入路径建议
+  第八部分: 待讨论的问题
+
+
+================================================================================
+第一部分: 性能瓶颈根因再分析
+================================================================================
+
+你的理解基本正确: node → cut → supergate → phase 的组合爆炸是性能瓶颈的
+直接原因。但深入到算法结构, 瓶颈有更精细的分层:
+
+---------- 层次 1: 调用次数爆炸 ----------
+
+leon3 实测数据:
+  FPGA: If_CutAreaDeref/Ref 总调用 = 48,629,390 次
+  ASIC: Map_CutRefDeref    总调用 = 1,251,058,289 次  (约 25.7 倍)
+
+ASIC 每个节点平均调用 Map_CutRefDeref 约 1,149 次, FPGA 仅约 42 次。
+这 27 倍的差异来自:
+  - cuts × supergates(截断到30) × phases × 2 polarities = O(C × S × P × 2)
+  vs FPGA 的 O(C × 1 × 1 × 1)
+
+---------- 层次 2: 每次调用的复杂度更高 ----------
+
+ASIC 的 Map_CutRefDeref:
+  - 3 维引用计数: nRefAct[0], nRefAct[1], nRefAct[2]
+  - Phase 判断 + inverter 面积加减
+  - pCutBest[fPhaseChild] == NULL 时需要切换 phase
+  - 分支逻辑: both-phase-present vs single-phase-present
+
+FPGA 的 If_CutAreaDeref:
+  - 1 维引用计数: nRefs
+  - 无 phase, 无 inverter
+  - 递归终止条件极简
+
+单步开销 ASIC 约为 FPGA 的 3-5 倍。
+
+---------- 层次 3: 冗余计算 ----------
+
+这是最关键的观察——大量调用是冗余的:
+
+在 Map_MatchNodeCut 的内循环中:
+  for (pSuper; pSuper; pSuper = pSuper->pNext)     // 最多 30 个 supergate
+      for (i = 0; i < pSuper->nPhases; i++)          // 每个有多个 phase
+          pMatch->AreaFlow = Map_CutGetAreaDerefed(pCut, fPhase);
+
+问题: 对同一个 cut 的不同 supergate, 多数情况下 leaf 结构相同,
+只是 (a) root area 不同, (b) leaf phase assignment 不同。
+但每次都做完整的 MFFC 递归遍历, 这是巨大的浪费。
+
+---------- 量化冗余 ----------
+
+对一个 5-leaf cut, 假设有 20 个 supergate, 每个平均 3 个 phase:
+  - 当前: 20 × 3 = 60 次 Map_CutRefDeref (每次平均遍历 ~3.3 个节点)
+  - 实际需要: 最多 2^5 = 32 种 leaf phase pattern (实际远少于此)
+  - 去除冗余后: ~5-10 次 Map_CutRefDeref + 60 次 O(nLeaves) 查表
+
+这意味着理论上可以减少 6-12 倍的 MFFC 递归调用。
+
+
+================================================================================
+第二部分: 优化方向总览
+================================================================================
+
+  +------+---------------------------+--------+----------+--------+---------+
+  | 编号 | 方向                      | 精确性 | 实现难度 | 预期加速| 理论性  |
+  +------+---------------------------+--------+----------+--------+---------+
+  |  A   | Root Area 分离 +          | 精确   | 中等     | 6-12x  | 强      |
+  |      | Phase-Pattern 分组        |        |          |        |         |
+  +------+---------------------------+--------+----------+--------+---------+
+  |  B   | Dirty-Flag 跳过未变节点   | 精确   | 低       | 1.5-3x | 中      |
+  +------+---------------------------+--------+----------+--------+---------+
+  |  C   | 增量 MFFC 维护            | 精确   | 高       | 2-5x   | 强      |
+  |      | (BoundLS 思想迁移)        |        |          |        |         |
+  +------+---------------------------+--------+----------+--------+---------+
+  | A+B  | 组合方案                  | 精确   | 中等     | 10-30x | 强      |
+  +------+---------------------------+--------+----------+--------+---------+
+
+
+================================================================================
+第三部分: 方向 A — Root Area 分离 + Phase-Pattern 分组 (精确优化)
+================================================================================
+
+---------- 核心观察 ----------
+
+Map_CutRefDeref(pCut, fPhase, ...) 的返回值可以分解为:
+
+  ExactArea(cut, super, phaseAssign) = RootArea(super) + LeafContrib(cut, phaseAssign)
+
+其中:
+  - RootArea(super) = pSuper->Area  (仅取决于 supergate, O(1) 可得)
+  - LeafContrib(cut, phaseAssign) 取决于 cut 的叶子节点在特定 phase 下的
+    递归 MFFC 面积之和
+
+关键: LeafContrib 只取决于 (cut, phaseAssign), 与 supergate 的选择无关。
+不同的 supergate 如果有相同的 phaseAssign, 它们的 LeafContrib 完全一样。
+
+---------- 算法设计 ----------
+
+Phase-Pattern 定义:
+  对一个 nLeaves 叶子的 cut, phase pattern 是一个 nLeaves-bit 向量,
+  记录每个叶子是正相位还是负相位。
+  pattern = uPhaseBest & ((1 << nLeaves) - 1)
+
+改进的 Map_MatchNodeCut:
+
+  // Step 1: 收集所有出现的 unique phase patterns
+  //         并预计算每个 pattern 的 LeafContrib
+  int patternsSeen[32] = {0};  // 最多 2^5 = 32 种 pattern
+  float leafContrib[32];       // 缓存每个 pattern 的叶子贡献
+
+  for (pSuper, Counter = 0; pSuper; pSuper = pSuper->pNext, Counter++)
+  {
+      if (Counter == 30) break;
+      for (i = 0; i < pSuper->nPhases; i++)
+      {
+          unsigned pattern = (pMatch->uPhase ^ pSuper->uPhases[i])
+                             & ((1 << pCut->nLeaves) - 1);
+
+          if (!patternsSeen[pattern])
+          {
+              patternsSeen[pattern] = 1;
+              // 设置 uPhaseBest 以匹配当前 pattern
+              pMatch->uPhaseBest = pattern;  // 简化表示
+              // 做一次完整的 MFFC 遍历, 但只计算叶子贡献
+              leafContrib[pattern] = Map_CutGetAreaDerefed_LeafOnly(pCut, fPhase);
+          }
+
+          // Step 2: 用缓存的 leafContrib + 当前 supergate 的 root area
+          pMatch->AreaFlow = pSuper->Area + leafContrib[pattern];
+
+          // 后续比较逻辑不变
+          ...
+      }
+  }
+
+---------- 复杂度分析 ----------
+
+  改进前: O(nSupers × nPhases × MFFC_traversal)
+         = O(30 × P × 3.3) ≈ O(300) 节点访问 / cut
+
+  改进后: O(min(2^nLeaves, nSupers×nPhases) × MFFC_traversal + nSupers×nPhases × nLeaves)
+         = O(10 × 3.3 + 90 × 5) ≈ O(483)  ...
+
+  等等, 这里我需要更仔细地分析。
+
+  关键点: 实际出现的 unique patterns 远少于 2^nLeaves。
+  因为 supergate 的 phase 组合受限于库中实际存在的 gate 类型。
+
+  leon3 实测:
+    总调用 627M 次 Map_CutRefDeref (Mode2)
+    节点数 ~1.46M, 平均每节点 ~430 次调用
+
+  如果 unique patterns 平均只有 ~10 种:
+    改进后每节点: ~10 次 MFFC 遍历 + 430 次 O(5) 查表
+                = ~33 + ~2150 ≈ 2183 次操作
+    改进前每节点: ~430 次 MFFC 遍历 (每次 ~3.3 节点)
+                ≈ 1419 次节点访问
+
+  嗯, 从节点访问角度看, 改进后查表的常数操作很轻量, 而 MFFC 遍历的
+  重量级操作从 430 次减少到 ~10 次。实际的性能提升取决于:
+  (a) MFFC 遍历的实际开销 (函数调用、cache miss、分支预测)
+  (b) 查表操作的开销 (几乎可忽略)
+
+  保守估计: 核心 MFFC 遍历减少 40x, 但新增 O(nLeaves) 查表开销,
+  总体加速 6-12 倍。
+
+---------- 正确性证明 ----------
+
+  定理: 对相同 cut 和相同 leaf phase pattern, 不同 supergate 的
+  LeafContrib 完全相同。
+
+  证明:
+  在 Map_CutRefDeref 中, 递归路径完全由以下因素决定:
+  (1) pCut->ppLeaves[i] — 叶子节点 (cut 固定则叶子固定)
+  (2) fPhaseChild = Map_CutGetLeafPhase(pCut, fPhase, i)
+      = ((uPhaseBest & (1<<i)) == 0) — 取决于 phase pattern
+  (3) pNodeChild->nRefAct[fPhaseChild] — 当前引用计数 (全局状态)
+  (4) pNodeChild->pCutBest[fPhaseChild] — 子节点的最佳 cut (全局状态)
+
+  因子 (1)(2) 对相同 cut + 相同 pattern 是相同的。
+  因子 (3)(4) 是全局状态, 与当前评估的 supergate 无关。
+
+  因此递归路径完全一致, 叶子贡献完全一致。
+  唯一不同的是 Map_CutGetRootArea(pCut, fPhase), 它返回
+  pCut->M[fPhase].pSuperBest->Area, 即当前 supergate 的面积。 □
+
+---------- 实现注意事项 ----------
+
+  (1) Map_CutGetAreaDerefed 内部做 ref+deref 配对, 恢复全局状态。
+      预计算 leafContrib 时, 也必须保证状态恢复。
+      具体做法: 实现一个 Map_CutGetLeafContribDerefed(pCut, fPhase)
+      = Map_CutGetAreaDerefed(pCut, fPhase) - Map_CutGetRootArea(pCut, fPhase)
+
+  (2) 在 ref/deref 过程中, 不同叶子之间可能共享子节点。
+      这不影响正确性, 因为共享节点的处理完全由递归内部的 nRefAct
+      增减逻辑管理, 与 root area 无关。
+
+  (3) fUpdateProf 参数(gate profile 更新)在评估阶段为 0, 不影响。
+
+  (4) 需要注意: pMatch->uPhaseBest 在循环内被修改。
+      预计算时需要正确设置 uPhaseBest, 评估时需要恢复。
+
+
+================================================================================
+第四部分: 方向 B — Dirty-Flag 跳过未变化节点 (增量思想)
+================================================================================
+
+---------- 核心观察 ----------
+
+Exact area recovery 处理所有节点, 但实际上很多节点的最优映射在
+area recovery 过程中并未改变。如果能跳过这些节点, 可以节省大量计算。
+
+实测数据 (leon3, Mode2):
+  总节点数: ~1.46M
+  实际被引用的节点 (nRefAct[2] > 0): 预计 ~0.8M (约 55%)
+  其中 best cut 实际发生变化的节点: 预计 ~0.2M (约 14%)
+  (exact area recovery 的净收益 = Area1 - Area2, 只有变化时才 > 0)
+
+---------- 算法设计 ----------
+
+  (1) 初始标记: 所有节点标记为 dirty (第一轮全部处理)
+
+  (2) 处理节点 n 时:
+      - 如果 n 是 clean 且 n 的 best cut 的所有叶子都是 clean:
+        → 跳过 (其 exact area 不可能改善)
+      - 否则: 正常处理 (deref-old, evaluate-new, ref-new)
+        → 如果 best cut 发生变化:
+          将 n 的 fanout 中使用 n 作为叶子的节点标记为 dirty
+
+  (3) 反向传播: 当节点 n 的 best cut 改变时, 其 MFFC 中的
+      引用计数变化可能影响其他节点的 exact area。
+      需要将"可能受影响"的节点标记为 dirty。
+
+---------- 受影响范围分析 ----------
+
+  当节点 n 的 best cut 从 C_old 变为 C_new:
+
+  直接影响:
+    - C_old 的叶子: 失去一个引用 (nRefAct 减少)
+    - C_new 的叶子: 获得一个引用 (nRefAct 增加)
+
+  间接影响:
+    - nRefAct 变化的叶子, 如果被其他节点的 cut 引用,
+      那些节点的 exact area 也可能变化
+    - 这种传播通过 MFFC 结构进行, 通常范围有限
+      (average MFFC size ≈ 3.3)
+
+  类比 BoundLS:
+    BoundLS 通过维护 partial topological order 将受影响区域
+    限制在 O(||ΔG||) 范围内。
+    这里的 ΔG 等价于 "cut 变化涉及的叶子集合差异",
+    通常 ||ΔG|| ≤ 2 × nLeaves ≈ 10。
+
+---------- 实现复杂度 ----------
+
+  - 需要为每个节点维护 dirty flag: O(1) 额外空间/节点
+  - 需要维护 "谁引用了我" 的反向映射: 已有 (nRefAct)
+    但需要更细粒度的 "哪些节点的 cut 以我为叶子":
+    这需要额外的数据结构或遍历
+
+  简化实现:
+    不维护精确的反向映射, 而是保守地标记:
+    - 当节点 n 改变时, 标记 n 的所有 transitive fanout 为 dirty
+    - 这过于保守, 但实现简单
+
+    更好的近似:
+    - 只标记直接使用 n 的节点为 dirty (通过 cut 叶子关系)
+    - 需要在 cut 数据结构中维护反向指针
+
+---------- 预期效果 ----------
+
+  保守估计: 跳过 40-60% 的节点 → 加速 1.5-2.5 倍
+  乐观估计: 跳过 70-80% 的节点 → 加速 3-5 倍
+
+  注意: 这个方向与方向 A 正交, 可以组合使用。
+
+
+================================================================================
+第五部分: 方向 C — 增量 MFFC 维护 (BoundLS 思想迁移)
+================================================================================
+
+---------- BoundLS 核心思想回顾 ----------
+
+BoundLS 解决的问题:
+  在逻辑优化 (rewrite/refactor) 中, 每次局部替换 ΔG_i 后,
+  需要更新所有受影响节点的 level 和 reverse level。
+
+BoundLS 的解决方案:
+  (1) dynTO: 维护 partial topological order, O(|V|Δ) 总时间
+  (2) dynLev: 利用拓扑序选择性计算 level, O(|V|) 总时间
+  (3) dynRL: 选择性计算 reverse level, O(|V|Δ log Δ) 总时间
+
+  核心创新: 将受影响区域从 O(|V|) 限制到 O(||ΔG_i||),
+  从而将总复杂度从 O(|V|^2) 降到 O(|V|Δ log Δ)。
+
+---------- 迁移到 ASIC Mapping 的可能性 ----------
+
+类比关系:
+
+  +-------------------+----------------------------+----------------------------+
+  | 概念              | BoundLS (逻辑优化)         | ASIC Mapping (Exact Area)  |
+  +-------------------+----------------------------+----------------------------+
+  | 底层图            | AIG G(V,E)                 | Mapped Circuit (nodes +    |
+  |                   |                            |   best cuts)               |
+  +-------------------+----------------------------+----------------------------+
+  | 局部变换          | ΔG_i: 替换子图             | 重映射: 改变节点 n 的      |
+  |                   | (rewrite/refactor)         | best cut/supergate         |
+  +-------------------+----------------------------+----------------------------+
+  | 需要维护的量      | L(n): node level           | ExactArea(n): MFFC 面积    |
+  |                   | R(n): reverse level        | nRefAct[]: 引用计数        |
+  +-------------------+----------------------------+----------------------------+
+  | 变化传播方向      | L: 沿 fanout 向前传播      | nRefAct: 沿 cut 叶子传播   |
+  |                   | R: 沿 fanin 向后传播       | ExactArea: 沿 fanout 传播  |
+  +-------------------+----------------------------+----------------------------+
+  | 局部变换大小      | ||ΔG_i|| ≤ k-feasible cut  | ||Δ映射|| ≤ 2 × nLeaves    |
+  |                   | (典型 ~10 节点)            | (典型 ~10 节点)            |
+  +-------------------+----------------------------+----------------------------+
+  | 受影响区域        | A_L, A_R ⊆ 传递 fanout/in | 受影响节点 ⊆ 传递 fanout   |
+  |                   | of ΔG_i                    | through cut-leaf relations |
+  +-------------------+----------------------------+----------------------------+
+
+---------- 增量 MFFC 维护算法设计 ----------
+
+目标: 维护每个节点的 MFFC_Area(n, phase) = 当前 best cut 的 exact area
+
+当节点 n 的 best cut 从 C_old 改为 C_new 时:
+
+  Step 1: 更新 nRefAct (已有的 deref-old / ref-new 逻辑)
+    - Map_CutDeref(C_old): 释放旧 MFFC, nRefAct 变化
+    - Map_CutRef(C_new):   引入新 MFFC, nRefAct 变化
+
+  Step 2: 识别受影响节点
+    - 旧 MFFC 中释放的节点: nRefAct 从 >0 变为 0
+    - 新 MFFC 中引入的节点: nRefAct 从 0 变为 >0
+    - 这些节点的 "被引用状态" 改变了, 影响了以它们为叶子的其他节点的
+      exact area
+
+  Step 3: 传播更新
+    - 对每个 nRefAct 变化的节点 m:
+      找到所有以 m 为 best-cut 叶子的节点 (m 的"映射消费者")
+      标记它们的 cached MFFC_Area 为 invalid
+    - 这些节点在后续处理时会重新计算
+
+  Step 4: 懒更新
+    - 当一个节点需要 exact area 评估时:
+      如果其 cached MFFC_Area 仍然有效, 直接使用
+      否则重新计算
+
+---------- 复杂度分析 ----------
+
+  类比 BoundLS 的分析框架:
+
+  受影响区域大小:
+    当节点 n 的 best cut 改变时, nRefAct 变化的节点数 ≤ MFFC_size(n)
+    平均 MFFC size ≈ 3.3
+    每个 nRefAct 变化的节点影响的 "映射消费者" 数量 ≤ max(nRefAct)
+
+  总复杂度:
+    如果能将每次重映射的传播限制在 O(MFFC_size × avg_fanout),
+    则总复杂度从 O(|V| × C × S × P × MFFC) 降到
+    O(|V| × C × S × P × nLeaves) + O(|V| × MFFC_size × avg_fanout)
+
+    第一项是评估候选的开销 (使用 cached MFFC_Area)
+    第二项是维护 cache 的开销
+
+---------- 实现挑战 ----------
+
+  (1) 缓存一致性:
+      需要保证 cached MFFC_Area 在所有 nRefAct 变化后正确更新。
+      BoundLS 通过 partial topological order 保证了更新顺序。
+      映射中也按拓扑序处理, 可以借鉴。
+
+  (2) 反向索引:
+      需要快速找到 "谁的 best cut 以节点 m 为叶子"。
+      当前数据结构中没有这个反向映射。
+      需要额外的数据结构 (链表/哈希表), 增加空间开销。
+
+  (3) 级联失效:
+      节点 A 改变 → 节点 B 的 cache 失效 → B 重新计算可能也改变
+      → 节点 C 的 cache 失效 → ...
+      需要控制级联传播的范围, 否则退化为全量计算。
+
+      BoundLS 的 Property 1 提供了类似的保证:
+      "只需要维护替换节点 x' 的 transitive fanin 中 L(m)
+       和 transitive fanout 中 R(n) 的正确性"
+
+      映射中的对应性质:
+      "只需要维护 changed-node 的 transitive fanout (通过 cut-leaf 关系)
+       中节点的 MFFC_Area 的正确性"
+
+  (4) 多阶段交互:
+      Exact area recovery 分 Mode2 和 Mode3 两个阶段。
+      Mode3 还涉及 phase dropping, 增加了状态变化的复杂度。
+      Cache 在阶段之间需要重新初始化。
+
+
+================================================================================
+第六部分: BoundLS 与 ASIC Mapping 的深度对比
+================================================================================
+
+---------- 相似点 ----------
+
+  (1) 问题结构: 都是在 DAG 上的迭代局部优化
+      - BoundLS: 按拓扑序遍历节点, 尝试 rewrite/refactor
+      - ASIC mapping: 按拓扑序遍历节点, 尝试 remapping (选择更好的 cut)
+
+  (2) 局部变换: 变换都是局部的, 只影响有限范围
+      - BoundLS: ΔG 的 extended size ||ΔG|| 有界 (k-feasible cut)
+      - Mapping: cut 改变影响的 nRefAct 变化范围有界 (MFFC size)
+
+  (3) 传播特性: 变化通过图结构传播
+      - BoundLS: level 变化沿 fanout 传播
+      - Mapping: nRefAct 变化沿 MFFC 结构传播
+
+  (4) 当前方法都是 unbounded:
+      - BoundLS 之前的 incLM: O(|V|^2) 总复杂度
+      - 当前 exact area: 每个节点评估所有候选, 无论是否受影响
+
+---------- 根本差异 ----------
+
+  (1) 维护的量的性质不同:
+
+      BoundLS 维护 level:
+        - 标量值 L(n) = 1 + max{L(f) | f ∈ fanin(n)}
+        - 单调递推, 确定性计算
+        - 每个节点只需维护一个值
+
+      ASIC mapping 维护 exact area:
+        - ExactArea(cut) = RootArea + Σ RecursiveArea(exclusive_leaves)
+        - 依赖全局 nRefAct 状态 (非局部)
+        - 每个节点需要评估多个候选 (cuts × supergates × phases)
+        - "独占性" (exclusive) 判断依赖全局引用计数
+
+  (2) 变化传播的方向和性质不同:
+
+      BoundLS:
+        - Level 向前传播 (fanout 方向), 单调非减
+        - Reverse level 向后传播 (fanin 方向), 单调非减
+        - 传播有明确的终止条件 (level 不变则停止)
+
+      ASIC mapping:
+        - nRefAct 变化是双向的 (deref 释放, ref 引入)
+        - 没有单调性保证
+        - 传播通过 MFFC 结构, 可能在映射改变时完全重构
+
+  (3) 优化目标不同:
+
+      BoundLS 优化的是 "维护开销":
+        - 每次变换后, level 维护从 O(|V|) 降到 O(||ΔG||)
+        - 变换本身 (rewrite/refactor 评估) 不是瓶颈
+
+      ASIC mapping 的瓶颈是 "评估开销":
+        - 每个节点需要评估 ~100-1000 个候选
+        - 维护 nRefAct 的开销是次要的 (deref + ref 只各做一次)
+        - 真正的瓶颈是 Map_CutGetAreaDerefed 被调用在三层嵌套循环内
+
+  (4) 局部变换的规模不同:
+
+      BoundLS:
+        - ΔG 替换一个子图, 添加/删除节点
+        - 图的结构真正改变了
+
+      ASIC mapping:
+        - 不改变 AIG 结构, 只改变 "映射覆盖" (哪个 cut 被选中)
+        - 底层 AIG 保持不变
+
+---------- 哪些可以迁移, 哪些不能 ----------
+
+  可以迁移的思想:
+    ✓ 局部性原理: 变化只影响有限范围, 可以跳过不受影响的节点
+    ✓ 拓扑序处理: 利用拓扑序保证更新的正确性和有界性
+    ✓ 选择性更新: 只更新真正需要更新的节点 (BoundLS 的 Property 1)
+    ✓ Bounded affected region: 将受影响区域限制在局部变化的邻域
+
+  不能直接迁移的:
+    ✗ dynTO (动态拓扑序维护): 映射不改变图结构, 拓扑序不变
+    ✗ dynLev/dynRL 的具体算法: level 的递推关系与 exact area 不同
+    ✗ 亚二次复杂度保证: 评估候选的开销是主导因素,
+      这不是 BoundLS 框架能直接解决的
+
+
+================================================================================
+第七部分: 切入路径建议
+================================================================================
+
+---------- 推荐的渐进式优化路径 ----------
+
+  Phase 1: 方向 A (Root Area 分离)
+  ├── 实现难度: 中等
+  ├── 风险: 低 (精确优化, 不改变结果)
+  ├── 预期加速: 6-12x 在 exact area 阶段
+  ├── 实现步骤:
+  │   (1) 实现 Map_CutGetLeafContribDerefed(pCut, fPhase):
+  │       = Map_CutGetAreaDerefed(pCut, fPhase) - Map_CutGetRootArea(pCut, fPhase)
+  │   (2) 在 Map_MatchNodeCut 中添加 pattern 缓存数组
+  │   (3) 内循环改为: 查 pattern → 已缓存则查表, 否则计算并缓存
+  │   (4) 最终面积 = supergate.Area + leafContrib[pattern]
+  ├── 验证方法:
+  │   - 对比优化前后的映射结果 (面积、延迟应完全一致)
+  │   - 对比 Map_CutRefDeref 的调用次数减少量
+  │   - 在 leon3 上测量加速比
+  └── 算法分析:
+      - 正确性: 由第三部分的定理保证
+      - 复杂度: 从 O(S×P×MFFC) 降到 O(U×MFFC + S×P×L),
+        其中 U = unique patterns, L = nLeaves
+
+  Phase 2: 方向 B (Dirty-Flag)
+  ├── 实现难度: 低-中
+  ├── 风险: 低
+  ├── 预期加速: 1.5-3x (与 Phase 1 正交, 可叠加)
+  ├── 实现步骤:
+  │   (1) 为每个节点添加 dirty flag
+  │   (2) Map_MappingMatches 开始时标记所有节点为 dirty
+  │   (3) 处理节点时, 如果 clean 则跳过
+  │   (4) 如果节点的 best cut 改变, 标记相关节点为 dirty
+  └── 需要解决的问题:
+      - 如何高效地找到 "以节点 m 为 cut 叶子" 的上游节点
+      - 保守标记 vs 精确标记的权衡
+
+  Phase 3: 方向 C (增量 MFFC 维护) — 可选的深入方向
+  ├── 实现难度: 高
+  ├── 风险: 中 (实现复杂, 需要仔细验证)
+  ├── 预期加速: 2-5x (与 Phase 1+2 部分重叠)
+  ├── 适用条件: Phase 1+2 已完成, 仍需进一步加速
+  └── 需要的前置研究:
+      - 在 leon3 上 profile: MFFC 变化的频率和范围
+      - 评估 cache 维护的额外开销是否值得
+
+---------- 组合效果估算 ----------
+
+  leon3 基准:
+    当前: Mode2 + Mode3 = 142.43 + 144.52 = 286.95 sec
+    其中 Map_CutRefDeref: 101.90 + 101.89 = 203.79 sec (71%)
+
+  Phase 1 (Root Area 分离):
+    Map_CutRefDeref 减少 ~8x → 从 203.79 sec 降到 ~25.5 sec
+    其他开销不变: 286.95 - 203.79 = 83.16 sec
+    总计: ~108.7 sec (加速 2.6x)
+
+  Phase 1 + Phase 2 (+ Dirty-Flag):
+    跳过 ~50% 节点 → 83.16/2 + 25.5/2 = ~54.3 sec
+    总计: ~54.3 sec (加速 5.3x)
+
+  注: 以上是粗略估计, 实际效果需要实验验证。
+
+
+================================================================================
+第八部分: 待讨论的问题
+================================================================================
+
+在深入分析过程中, 有以下问题希望与你确认:
+
+  (1) 关于方向 A 的一个细节:
+      Map_CutGetAreaDerefed 在内循环中被调用时, 旧 cut 已经被真实 deref 了。
+      不同 supergate 的评估是在 "旧 MFFC 已释放" 的状态下进行的。
+
+      问题: 在这个状态下, 对同一 pattern 的多次 ref+deref 确实等价吗?
+      答案: 是的。因为每次 ref+deref 都完整恢复状态, 是无副作用的操作。
+      同一 pattern 在同一全局状态下必然产生相同结果。
+
+      但需要确认: 在 Map_MatchNodeCut 的循环中,
+      pMatch->pSuperBest 被修改为当前 pSuper, 这是否影响
+      Map_CutGetRootArea 的返回值?
+      → 是的, 它确实会影响! Map_CutGetRootArea 读取的是 pSuperBest->Area。
+      所以我们需要确保 leafContrib 的计算不依赖于 pSuperBest,
+      而是单独计算叶子部分。
+
+      实现时需要注意: Map_CutRefDeref 的第一行就是
+      aArea = Map_CutGetRootArea(pCut, fPhase),
+      这读取的是当前 pSuperBest 的面积。所以要分离 leafContrib,
+      需要在调用前临时设置一个 "dummy" supergate (area=0),
+      或者修改 Map_CutRefDeref 返回分离后的结果。
+
+  (2) 方向 B 的实际效果:
+      你在之前的实验中, 是否观察过 exact area recovery 过程中
+      实际发生 best cut 变化的节点比例? 这个数据对评估方向 B 的效果
+      至关重要。
+
+  (3) BoundLS 的直接应用场景:
+      你提到了将 BoundLS 的增量图计算思想引入 ASIC mapping。
+
+      除了上面分析的 "增量 MFFC 维护" 之外, BoundLS 是否也可以用于
+      加速 mapping 过程中的其他环节?
+
+      例如: Map_TimeComputeRequiredGlobal (required time 计算)
+      在每个阶段之间都需要全局重新计算。如果 mapping 变化有限,
+      是否可以增量更新 required times?
+      这与 BoundLS 的 dynRL (增量 reverse level) 非常类似。
+
+  (4) 你更关注哪个方面?
+      - 纯工程优化 (方向 A, 立即可得的加速)
+      - 算法理论贡献 (方向 C, 可能发表论文的新框架)
+      - 还是两者兼顾?
+      这会影响我建议的切入深度和方向。
+
+  (5) 目前在实际mapping 的过程中, Phase 0 (Delay-optimal mapping),
+      Phase 1 (Area flow recovery), Phase 2/3 (Exact area recovery)
+      各自的运行时间占比分别是多少?
+      从 leon3 的数据来看:
+        Phase 0 (Delay):     12.78 sec (3.4%)
+        Phase 1 (AreaFlow):  45.18 sec (12.1%)
+        Phase 2 (ExactArea): 142.43 sec (38.2%)
+        Phase 3 (ExactArea): 144.52 sec (38.8%)
+        其他:               27.81 sec (7.5%)
+
+      Phase 2+3 占了 77%, 绝对是值得优化的目标。
+      但 Phase 1 的 45 sec 也不小 — 是否也有优化空间?
+      (Phase 1 使用 area flow 而非 exact area, 不涉及 MFFC 遍历,
+       瓶颈可能在别处)

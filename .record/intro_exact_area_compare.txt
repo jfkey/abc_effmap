@@ -1,0 +1,416 @@
+================================================================================
+   ASIC vs FPGA Exact Area Recovery 性能对比：为什么 ASIC 是瓶颈
+================================================================================
+参考代码:
+  ASIC mapper: src/map/mapper/mapperMatch.c, mapperRefs.c, mapperCore.c
+  FPGA mapper: src/map/if/ifMap.c, ifCut.c, ifCore.c
+参考论文: "Improvements in FPGA Technology Mapping" (Chatterjee, Mishchenko, Brayton)
+
+
+================================================================================
+1. 总览：两者 Exact Area 的基本思想完全相同
+================================================================================
+
+无论 ASIC 还是 FPGA，exact area recovery 的核心思想都是一样的：
+
+  (1) Deref 旧 cut：在 mapped circuit 上递归解引用当前 best cut，
+      释放其 MFFC（独占资源），得到旧 cut 的真实面积 Area1
+
+  (2) 评估新 cut：在旧 MFFC 已释放的状态下，临时 ref 新候选 cut，
+      计算引入面积；再 deref 恢复状态
+
+  (3) 选择最优：选 exact area 最小且满足 timing 的 cut
+
+  (4) Ref 新 cut：真实引用新选定的 best cut
+
+  净收益 = Area1 - Area2 >= 0，保证面积单调非增。
+
+FPGA (ifCut.c) 和 ASIC (mapperRefs.c) 的 Deref/Ref 函数结构高度相似：
+
+  FPGA: If_CutAreaDeref()  / If_CutAreaRef()  / If_CutAreaDerefed()
+  ASIC: Map_CutRefDeref()  / Map_CutDeref()   / Map_CutRef()
+        Map_CutGetAreaDerefed() / Map_CutGetAreaRefed()
+
+两者都是沿 best cut 的叶子递归，用引用计数判断是否属于 MFFC 内部。
+
+
+================================================================================
+2. 关键差异：为什么 ASIC Exact Area 是性能瓶颈
+================================================================================
+
+尽管思想相同，ASIC exact area recovery 的计算开销远大于 FPGA，
+原因在于三个维度的复杂度爆炸：
+
+--------------------------------------------------------------------------
+  维度 1：每个节点需要评估的"候选 cut × supergate × phase"数量远大于 FPGA
+--------------------------------------------------------------------------
+
+  FPGA mapper (ifMap.c):
+    - 每个节点维护 nCutsMax 个 priority cuts（默认 8 个）
+    - 每个 cut 对应唯一的一个 K-LUT 实现
+    - exact area 评估次数 = nCuts（每个 cut 调用一次 If_CutAreaDerefed）
+    - 典型数量：8 次/节点
+
+  ASIC mapper (mapperMatch.c):
+    - 每个节点有多个 cuts
+    - 每个 cut 有一个 supergate 链表（pMatch->pSupers），链表可能很长
+    - 每个 supergate 有多个 phase assignment（pSuper->nPhases）
+    - 在 Map_MatchNodeCut() 中的循环结构是：
+
+        for ( pSuper = pMatch->pSupers; pSuper; pSuper = pSuper->pNext )  // 遍历 supergates
+            for ( i = 0; i < pSuper->nPhases; i++ )                       // 遍历 phases
+                pMatch->AreaFlow = Map_CutGetAreaDerefed( pCut, fPhase );  // 计算 exact area
+
+    - 虽然有 Counter == 30 的截断（最多遍历 30 个 supergates），
+      但每个 supergate 还有多个 phase，实际调用次数 = Σ(nPhases_i) for i=1..30
+    - 而且这个循环对每个 cut 都要执行一次
+    - 典型数量：数十到数百次/节点
+
+  结论：ASIC 每个节点调用 exact area 的次数是 FPGA 的 ~10-100 倍。
+
+--------------------------------------------------------------------------
+  维度 2：每次 Deref/Ref 递归的深度和复杂度更高
+--------------------------------------------------------------------------
+
+  FPGA mapper (ifCut.c:1056-1069, If_CutAreaDeref):
+    float If_CutAreaDeref( If_Man_t * p, If_Cut_t * pCut )
+    {
+        Area = If_CutLutArea(p, pCut);             // LUT 面积 = 1
+        If_CutForEachLeaf( p, pCut, pLeaf, i )
+        {
+            if ( --pLeaf->nRefs > 0 || !If_ObjIsAnd(pLeaf) )
+                continue;                           // 还有引用，不递归
+            Area += If_CutAreaDeref( p, If_ObjCutBest(pLeaf) );  // 递归
+        }
+        return Area;
+    }
+
+    特点：
+    - 只有一个引用计数 nRefs（没有 phase 区分）
+    - 叶子节点数 <= K（LUT size，典型 6）
+    - 递归终止条件简单：nRefs > 0 或不是 AND 节点
+    - 不需要处理 inverter
+
+  ASIC mapper (mapperRefs.c:229-322, Map_CutRefDeref):
+    float Map_CutRefDeref( Map_Cut_t * pCut, int fPhase, int fReference, int fUpdateProf )
+    {
+        aArea = Map_CutGetRootArea( pCut, fPhase );  // supergate 面积（变化的！）
+        for ( i = 0; i < pCut->nLeaves; i++ )
+        {
+            pNodeChild  = pCut->ppLeaves[i];
+            fPhaseChild = Map_CutGetLeafPhase( pCut, fPhase, i );
+
+            if ( fReference ) {
+                if ( pNodeChild->pCutBest[0] && pNodeChild->pCutBest[1] ) {
+                    pNodeChild->nRefAct[2]++;
+                    if ( pNodeChild->nRefAct[fPhaseChild]++ > 0 )
+                        continue;
+                } else {
+                    if ( pNodeChild->nRefAct[fPhaseChild]++ == 0
+                         && pNodeChild->pCutBest[fPhaseChild] == NULL )
+                        aArea += pNodeChild->p->pSuperLib->AreaInv;  // inverter!
+                    if ( pNodeChild->nRefAct[2]++ > 0 )
+                        continue;
+                }
+            }
+            else { /* 对称的 deref 逻辑 */ }
+
+            pCutChild = pNodeChild->pCutBest[fPhaseChild];
+            if ( pCutChild == NULL ) {
+                fPhaseChild = !fPhaseChild;
+                pCutChild   = pNodeChild->pCutBest[fPhaseChild];
+            }
+            aArea += Map_CutRefDeref( pCutChild, fPhaseChild, fReference, fUpdateProf );
+        }
+        return aArea;
+    }
+
+    特点：
+    - 三个引用计数 nRefAct[0], nRefAct[1], nRefAct[2]（负相位、正相位、总计）
+    - 每个叶子需要判断 phase 和 inverter
+    - 递归前需要检查 pCutBest[fPhaseChild] 是否存在，可能切换 phase
+    - 需要处理 inverter 面积的加减
+    - 分支逻辑复杂：both-phase-present vs single-phase-present
+    - 每次递归的常数开销比 FPGA 大得多
+
+  结论：ASIC 每次 Deref/Ref 调用的单步开销约为 FPGA 的 3-5 倍。
+
+--------------------------------------------------------------------------
+  维度 3：每个节点需要处理两个 phase
+--------------------------------------------------------------------------
+
+  FPGA mapper (ifMap.c:162, If_ObjPerformMappingAnd):
+    - 每个节点只需处理一次
+    - 流程：deref → 遍历 cuts → 选最佳 → ref
+    - 一个节点一个 best cut
+
+  ASIC mapper (mapperMatch.c:255, Map_MatchNodePhase):
+    - 每个节点需要处理两个 phase（fPhase=0 和 fPhase=1）
+    - 由 Map_MappingMatches() 对每个节点调用两次 Map_MatchNodePhase()
+    - 每个 phase 都要独立做：deref 旧 cut → 遍历所有 cut 的所有 supergate →
+      选最佳 → ref 新 cut
+    - 额外地，阶段 3 还有 Map_NodeTryDroppingOnePhase()
+
+  结论：ASIC 需要处理的 phase 数是 FPGA 的 2 倍。
+
+
+================================================================================
+3. 综合对比：一个节点的 exact area 工作量
+================================================================================
+
+  +------------------------+------------------+----------------------------+
+  | 因素                   | FPGA             | ASIC                       |
+  +------------------------+------------------+----------------------------+
+  | 候选 cut 数            | ~8               | 多个 cut                   |
+  | 每个 cut 的实现数      | 1 (K-LUT)        | 最多 30 supergates ×       |
+  |                        |                  | 多个 phase assignments     |
+  | Deref/Ref 调用次数/节点| ~8               | 数十 ~ 数百                |
+  | 每次 Deref/Ref 的复杂度| 简单             | 3-5x（phase + inverter）   |
+  |                        | (单 ref count,   | (三个 ref count,           |
+  |                        |  无 phase)       |  phase 判断, inverter)     |
+  | Phase 数               | 1                | 2                          |
+  | 每节点总开销           | ~8 次简单递归    | 数百次复杂递归             |
+  +------------------------+------------------+----------------------------+
+
+  粗略估计：ASIC exact area 每个节点的工作量约为 FPGA 的 50-200 倍。
+
+
+================================================================================
+4. 为什么 FPGA Exact Area 不是瓶颈
+================================================================================
+
+(a) Cut 到实现的映射是 1:1
+
+    FPGA 中，一个 K-feasible cut 唯一对应一个 K-LUT 实现。
+    不存在 supergate 的概念，不需要枚举不同的 gate 组合。
+    所以对于每个 cut，exact area 只需要计算一次。
+
+(b) 没有 Phase 处理
+
+    FPGA 的 LUT 可以实现任意布尔函数，正相位和负相位没有区别
+    （或者说，LUT 天然支持函数的 complement，只需翻转真值表）。
+    所以 FPGA mapper 只维护一个引用计数 nRefs，
+    不需要 nRefAct[0]/[1]/[2] 这样的三维引用计数。
+    递归逻辑极其简单。
+
+(c) Deref/Ref 递归更浅
+
+    FPGA 的 cut 叶子数 <= K（典型 6），
+    且每个叶子直接对应 best cut 的叶子（不需要 phase 切换）。
+    递归快速终止，不会产生深层递归。
+
+(d) 面积计算是常数时间
+
+    FPGA 中 LUT 面积是常数（通常为 1），不需要查询 supergate 的面积。
+    ASIC 中面积 = Map_CutGetRootArea(pCut, fPhase)，
+    需要查询 pSuperBest->Area，这是一个变化值。
+
+(e) Cut 数量少且固定
+
+    FPGA 使用 priority cuts（默认 8 个），
+    cut 集合在枚举阶段就被裁剪到固定大小。
+    ASIC 的 cut 数量虽然也有限制，但每个 cut 上挂载的
+    supergate 链表使得有效候选数大幅膨胀。
+
+
+================================================================================
+5. ASIC Exact Area 瓶颈的根本原因总结
+================================================================================
+
+ASIC technology mapping 中 exact area recovery 是性能瓶颈的根本原因是
+"组合爆炸"：
+
+                    FPGA: cuts × 1 实现 × 1 phase = O(C)
+                    ASIC: cuts × supergates × phases × 2 polarities = O(C × S × P × 2)
+
+其中：
+  C = cut 数量
+  S = 每个 cut 的 supergate 数量（截断到 30）
+  P = 每个 supergate 的 phase 数量
+
+每一次 exact area 评估（Map_CutGetAreaDerefed）都需要一次完整的
+Deref/Ref 递归，而这个递归本身因为 phase 处理又比 FPGA 复杂数倍。
+
+两个乘法因子叠加：
+  调用次数 × 每次开销 = (50-200x) × (3-5x) = 总开销约 FPGA 的 150-1000 倍
+
+这就是为什么在 ASIC mapping 中，exact area recovery 占据了大部分运行时间，
+而在 FPGA mapping 中，cut 枚举（cut merging / cut filtering）才是真正的瓶颈。
+
+
+================================================================================
+6. 代码层面的直接对比
+================================================================================
+
+---------- FPGA exact area 核心循环 (ifMap.c:162-577) ----------
+
+  void If_ObjPerformMappingAnd( ... int Mode ... )
+  {
+      // 1. Deref 旧 cut（一次，简单）
+      if ( Mode && pObj->nRefs > 0 )
+          If_CutAreaDeref( p, If_ObjCutBest(pObj) );          // 行 183
+
+      // 2. 遍历 cuts，评估 exact area
+      If_ObjForEachCut( pObj->pFanin0, pCut0, i )
+      If_ObjForEachCut( pObj->pFanin1, pCut1, k )
+      {
+          ...
+          pCut->Area = (Mode == 2) ?
+              If_CutAreaDerefed( p, pCut ) :                   // 行 532
+              If_CutAreaFlow( p, pCut );
+          ...
+      }
+
+      // 3. Ref 新 cut（一次，简单）
+      if ( Mode && pObj->nRefs > 0 )
+          If_CutAreaRef( p, If_ObjCutBest(pObj) );            // 行 569
+  }
+
+  关键点：对每个 cut 调用一次 If_CutAreaDerefed，该函数内部是
+  ref + deref 配对，每次递归只检查 nRefs 这一个计数器。
+
+---------- ASIC exact area 核心循环 (mapperMatch.c:163-346) ----------
+
+  int Map_MatchNodeCut( ... int fPhase, float fWorstLimit )
+  {
+      // 遍历 supergates × phases
+      for ( pSuper = pMatch->pSupers, Counter = 0;
+            pSuper; pSuper = pSuper->pNext, Counter++ )
+      {
+          if ( Counter == 30 ) break;                          // 行 178
+
+          for ( i = 0; i < pSuper->nPhases; i++ )             // 行 183
+          {
+              pMatch->uPhaseBest = pMatch->uPhase ^ pSuper->uPhases[i];
+              if ( p->fMappingMode == 2 || p->fMappingMode == 3 )
+                  pMatch->AreaFlow = Map_CutGetAreaDerefed( pCut, fPhase );  // 行 202
+              ...
+          }
+      }
+  }
+
+  int Map_MatchNodePhase( ... int fPhase )                     // 每个 phase 调用一次
+  {
+      // Step 1: Deref 旧 cut
+      Area1 = Map_CutDeref( pCutBest, fPhase, ... );          // 行 286
+
+      // Step 2: 遍历所有 cuts
+      for ( pCut = ...; pCut; pCut = pCut->pNext )
+          Map_MatchNodeCut( p, pNode, pCut, fPhase, ... );    // 内含上述循环
+
+      // Step 3: Ref 新 cut
+      Area2 = Map_CutRef( pNode->pCutBest[fPhase], ... );     // 行 346
+  }
+
+  // 外层：每个节点两个 phase
+  Map_MatchNodePhase( p, pNode, 0 );  // 负相位
+  Map_MatchNodePhase( p, pNode, 1 );  // 正相位
+
+  关键点：Map_CutGetAreaDerefed 被调用在三层嵌套循环内
+  （节点 × cuts × supergates × phases），每次调用涉及复杂的
+  三维引用计数递归。
+
+
+================================================================================
+7. 总结表格
+================================================================================
+
+  +---------------------------+-------------------+---------------------------+
+  | 对比维度                  | FPGA (if mapper)  | ASIC (mapper)             |
+  +---------------------------+-------------------+---------------------------+
+  | 实现选择                  | 1:1 (cut → LUT)   | 1:N (cut → supergates)    |
+  | Phase 处理                | 无                 | 双 phase + inverter       |
+  | 引用计数维度              | 1 (nRefs)          | 3 (nRefAct[0/1/2])        |
+  | Deref/Ref 单步复杂度      | O(K) 简单递归     | O(K) 复杂递归 + phase     |
+  | 每节点 exact area 调用数  | ~C (cuts)          | ~C × S × P × 2           |
+  | Exact area 是否为瓶颈     | 否（cut 枚举才是）| 是（占主要运行时间）      |
+  | 面积值                    | 常数 (1)           | 变量 (supergate area)     |
+  | Inverter 处理             | 无                 | 需要加减 AreaInv          |
+  +---------------------------+-------------------+---------------------------+
+
+  其中 C = cut 数, S = supergate 数 (max 30), P = phase 数/supergate
+
+  FPGA 的真正瓶颈是 cut 枚举（cut merging），不是 area recovery。
+  ASIC 的真正瓶颈是 exact area recovery，因为 supergate × phase 的
+  组合爆炸使得每个节点需要大量的 Deref/Ref 递归调用。
+
+
+================================================================================
+8. 对比示例：
+================================================================================
+
+---------- ../../benchmarks/leon3.aig  FPGA 映射  ----------
+../benchmarks/leon3.aig           : i/o =370159/252691  lat =    0  and =1088122  lev = 59
+
+abc 05> read ../../benchmarks/leon3.aig; if -v -K 6; time; ps 
+K = 6. Memory (bytes): Truth =    0. Cut =   72. Obj =  152. Set =  744. CutMin = no
+Node = 1088122.  Ch =     0.  Total mem =  274.13 MB. Peak cut mem =   17.48 MB.
+P:  Del =   13.00.  Ar =  494756.0.  Edge =  2206743.  Cut = 15584284.  T =     7.15 sec
+P:  Del =   13.00.  Ar =  305089.0.  Edge =  1435594.  Cut = 10991429.  T =     5.58 sec
+P:  Del =   13.00.  Ar =  304975.0.  Edge =  1291991.  Cut = 15122288.  T =     7.17 sec
+E:  Del =   13.00.  Ar =  304076.0.  Edge =  1288241.  Cut = 15122288.  T =     1.08 sec
+F:  Del =   13.00.  Ar =  301809.0.  Edge =  1290458.  Cut = 12313072.  T =     5.46 sec
+E:  Del =   13.00.  Ar =  301668.0.  Edge =  1289831.  Cut = 12313072.  T =     1.26 sec
+FPGA If_CutAreaDeref/Ref profiling [AreaFlow]:
+  Total time         :       0.54 sec
+  Top-level calls    : 3022672
+  Max MFFC size      : 609  (nodes visited in single DFS)
+  Average MFFC size  : 2.41
+  Total nodes visited: 7294548
+A:  Del =   13.00.  Ar =  301043.0.  Edge =  1246304.  Cut = 12724063.  T =    10.00 sec
+E:  Del =   13.00.  Ar =  300979.0.  Edge =  1246228.  Cut = 12724063.  T =     1.07 sec
+A:  Del =   13.00.  Ar =  300949.0.  Edge =  1246079.  Cut = 12576927.  T =     9.31 sec
+E:  Del =   13.00.  Ar =  300948.0.  Edge =  1246080.  Cut = 12576927.  T =     1.07 sec
+FPGA If_CutAreaDeref/Ref profiling [ExactArea]:
+  Total time         :       6.17 sec
+  Top-level calls    : 45606718
+  Max MFFC size      : 605  (nodes visited in single DFS)
+  Average MFFC size  : 2.09
+  Total nodes visited: 95349368
+Total time =    49.40 sec
+Duplicated 67965 gates to decouple the CO drivers.
+elapse: 55.77 seconds, total: 70.58 seconds
+../../benchmarks/leon3        : i/o =370159/252691  lat =    0  nd =368968  edge =1322229  aig  =1333568  lev = 13
+
+每个平均调用 If_CutAreaDeref  45606718 + 3022672 /1088122 = 42 次 
+
+ 
+
+
+
+
+---------- ../../benchmarks/leon3.aig  ASIC 映射  ---------- 
+../benchmarks/leon3.aig           : i/o =370159/252691  lat =    0  and =1088122  lev = 59
+
+abc 07> read ../../benchmarks/leon3.aig; map -v; time; ps 
+Derived GENLIB library "asap7sc7p5t_22b_AO_RVT_SS_170906" with 73 gates using slew 20.00 ps and gain 250.00.
+Converting "../../benchmarks/asap7_clean.genlib" into supergate library "../../benchmarks/asap7_clean.super".
+Maximum level: Original = 59. Reduced due to choices = 59.
+Choice stats:  Choice nodes = 0. Total choices = 0.
+Nodes = 1458281.  Total 5-feasible cuts =   17845819.  Per node = 12.2. Time =    14.24 sec
+Delay    : Delay =     0.00  Flow =  31381642.0  Area =   1356790.4   0.0 %   Time =    12.78 sec
+AreaFlow : Delay =   541.64  Flow =    833180.0  Area =    908311.2  33.1 %   Time =    45.18 sec
+ASIC Map_CutRefDeref profiling [ExactArea-Mode2]:
+  Total time         :     101.90 sec
+  Top-level calls    : 627177747
+  Max MFFC size      : 687  (nodes visited in single DFS)
+  Average MFFC size  : 3.34
+  Total nodes visited: 2096313052
+Area     : Delay =   541.64  Flow =         0.0  Area =    856541.3  36.9 %   Time =   142.43 sec
+ASIC Map_CutRefDeref profiling [ExactArea-Mode3]:
+  Total time         :     101.89 sec
+  Top-level calls    : 623880542
+  Max MFFC size      : 693  (nodes visited in single DFS)
+  Average MFFC size  : 3.28
+  Total nodes visited: 2047367344
+Area     : Delay =   541.64  Flow =         0.0  Area =    849740.7  37.4 %   Time =   144.52 sec
+Output  po197383    : Delay = (541.64, 541.64)  NEG
+Output  po198275    : Delay = (541.64, 541.64)  NEG
+Output  po200640    : Delay = (541.64, 541.64)  NEG
+Output  po201228    : Delay = (541.64, 541.64)  NEG
+Output  po201229    : Delay = (541.64, 541.64)  NEG
+Total runtime =   372.72 sec
+elapse: 376.33 seconds, total: 446.90 seconds
+../../benchmarks/leon3        : i/o =370159/252691  lat =    0  nd =777903  edge =2013726  area =852300.95  delay =541.64  lev = 29
+ 
+每个平均调用 Map_CutRefDeref  627177747 + 623880542 /1088122 = 1,149 次 

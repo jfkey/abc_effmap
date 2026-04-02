@@ -180,7 +180,12 @@ void If_ObjPerformMappingAnd( If_Man_t * p, If_Obj_t * pObj, int Mode, int fPrep
         pObj->EstRefs = (float)((2.0 * pObj->EstRefs + pObj->nRefs) / 3.0);
     // deref the selected cut
     if ( Mode && pObj->nRefs > 0 )
-        If_CutAreaDeref( p, If_ObjCutBest(pObj) );
+    {
+        if ( Mode == 2 )
+            If_CutAreaDerefAndRecord( p, If_ObjCutBest(pObj) );
+        else
+            If_CutAreaDeref( p, If_ObjCutBest(pObj) );
+    }
 
     // prepare the cutset
     pCutSet = If_ManSetupNodeCutSet( p, pObj );
@@ -529,7 +534,17 @@ IfMapCutEvalDone:
         if ( Mode && pCut->Delay > pObj->Required + p->fEpsilon && pCutSet->nCuts > 0 )
             continue;
         // compute area of the cut (this area may depend on the application specific cost)
-        pCut->Area = (Mode == 2)? If_CutAreaDerefed( p, pCut ) : If_CutAreaFlow( p, pCut );
+        if ( Mode == 2 && pObj->nRefs > 0 )
+        {
+            // exact area with submodular bound pruning
+            float bestArea = (pCutSet->nCuts > 0) ? pCutSet->ppCuts[0]->Area : IF_FLOAT_LARGE;
+            float area = If_CutAreaDerefedWithPruning( p, pCut, bestArea );
+            if ( area < 0 )
+                continue;  // pruned by lower bound
+            pCut->Area = area;
+        }
+        else
+            pCut->Area = (Mode == 2)? If_CutAreaDerefed( p, pCut ) : If_CutAreaFlow( p, pCut );
         if ( p->pPars->fEdge )
             pCut->Edge = (Mode == 2)? If_CutEdgeDerefed( p, pCut ) : If_CutEdgeFlow( p, pCut );
         if ( p->pPars->fPower )

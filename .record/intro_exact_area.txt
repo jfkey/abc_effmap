@@ -1,0 +1,360 @@
+================================================================================
+              Exact Area 详解：定义、计算与 MFFC 的关系
+================================================================================
+参考代码: src/map/mapper/mapperMatch.c, mapperRefs.c, mapperCore.c
+参考论文: "Improvements in FPGA Technology Mapping" (Chatterjee, Mishchenko, Brayton)
+
+================================================================================
+1. 背景：Area Recovery 的整体流程
+================================================================================
+
+ABC 的 technology mapping 采用多阶段策略（mapperCore.c:Map_Mapping）：
+
+  阶段 0 (fMappingMode=0): Delay-optimal mapping
+    → 以最小延迟为目标，area flow 做 tie-breaking
+    → 得到初始映射，计算 nRefAct（实际引用计数）
+
+  阶段 1 (fMappingMode=1): Area recovery with area-flow
+    → 全局优化，用 area-flow 重新选 cut
+    → area-flow = 1 + Sum( area-flow(fanin) / fanout(fanin) )
+    → 优点：考虑全局共享；缺点：基于估计的 fanout
+
+  阶段 2 (fMappingMode=2): Area recovery with exact area
+    → 局部优化，用 exact area 重新选 cut
+    → 不涉及估计，直接在当前 mapping 的实际引用计数上操作
+
+  阶段 3 (fMappingMode=3): Area recovery with exact area + phase dropping
+    → 同阶段 2，但额外尝试丢弃节点的一个相位
+
+每个阶段之间都会调用：
+  Map_TimeComputeRequiredGlobal(p)  → 重新计算 required times
+  Map_MappingSetRefs(p)             → 重新计算实际引用计数 nRefAct
+  Map_MappingGetArea(p)             → 计算当前映射的总面积
+
+
+================================================================================
+2. Exact Area 的定义与物理含义
+================================================================================
+
+---------- 公式 ----------
+
+  Exact-Area(cut) = 1 + Sum[ exact-area(fanin) for fanin with no other fanout ]
+
+  或者更精确地说：
+  Exact-Area(cut) = cut 自身面积 + Sum[ 递归面积(子节点) | 子节点 nRefAct == 0 ]
+
+---------- 物理含义 ----------
+
+Exact area 回答的问题是：
+
+  "如果我选择这个 cut 来实现当前节点，在当前映射状态下，
+   这个 cut 会真正引入多少新的面积？"
+
+具体地：
+  - cut 自身的 gate 面积一定要算入（这是 cut 对应的 supergate 面积）
+  - cut 的叶子节点中，如果某个叶子已经被其他节点使用（nRefAct > 0），
+    则它的面积不需要重复计算——它已经存在于映射中了
+  - 只有那些仅被当前 cut 使用的叶子（nRefAct 在扣除当前引用后 == 0），
+    其面积需要递归计入
+
+这就是 MFFC 思想的直接应用：
+  - "仅被当前 cut 使用的节点" = MFFC 内部节点
+  - "还被其他节点使用的节点" = MFFC 边界
+
+---------- 与 Area-Flow 的对比 ----------
+
+  指标        | Area-Flow                    | Exact Area
+  ------------|------------------------------|-------------------------------
+  公式        | 1 + Sum(flow/fanout)         | 1 + Sum(area | exclusive)
+  Fanout 处理 | 按比例分摊                   | 0 或全部（是否独占）
+  视角        | 全局（考虑估计 fanout）      | 局部（基于实际 refcount）
+  估计        | 使用估计 fanout (nRefEst)    | 无估计，完全精确
+  优点        | 全局优化视野                 | 精确反映局部真实代价
+  缺点        | 基于估计可能不准             | 贪心，缺乏全局视野
+
+论文 slide 36 的例子清楚展示了两者的差异：
+  - cut {p,e,f}: area-flow=2.75, exact-area=1 (p 被其他节点使用)
+  - cut {s,t,q}: area-flow=2.5,  exact-area=2 (q 是独占的)
+  exact area 选 {p,e,f}（更好），area-flow 选 {s,t,q}（更差）
+
+
+================================================================================
+3. Exact Area 的计算方法——在 Mapping 后的电路上 Deref/Ref
+================================================================================
+
+关键澄清：Exact area 不是在原始 AIG 上计算的，而是在 mapping 之后的
+电路结构上，通过对 best cut 的 Deref/Ref 操作来计算的。
+
+具体来说：
+  - 操作对象是 mapping 后每个节点的 pCutBest（当前最佳 cut）
+  - 引用计数是 nRefAct[]（实际引用计数，由 Map_MappingSetRefs 计算）
+  - 递归沿着 best cut 的叶子展开，而非沿着 AIG 的 fanin 展开
+
+这是"借用了 MFFC 的思想"，但操作的数据结构是 mapped circuit，不是原始 AIG。
+
+---------- 核心函数 Map_CutRefDeref (mapperRefs.c:229-322) ----------
+
+float Map_CutRefDeref( Map_Cut_t * pCut, int fPhase, int fReference )
+{
+    aArea = Map_CutGetRootArea( pCut, fPhase );  // cut 自身 gate 面积
+
+    for ( i = 0; i < pCut->nLeaves; i++ )
+    {
+        pNodeChild = pCut->ppLeaves[i];
+        fPhaseChild = Map_CutGetLeafPhase( pCut, fPhase, i );
+
+        if ( fReference )  // Ref 操作
+        {
+            pNodeChild->nRefAct[2]++;
+            if ( pNodeChild->nRefAct[fPhaseChild]++ > 0 )
+                continue;  // 已被引用，不递归
+        }
+        else  // Deref 操作
+        {
+            --pNodeChild->nRefAct[2];
+            if ( --pNodeChild->nRefAct[fPhaseChild] > 0 )
+                continue;  // 还有其他引用，不递归（= MFFC 边界）
+        }
+
+        // nRefAct 降到 0 → 属于 MFFC 内部 → 递归
+        pCutChild = pNodeChild->pCutBest[fPhaseChild];
+        aArea += Map_CutRefDeref( pCutChild, fPhaseChild, fReference );
+    }
+    return aArea;
+}
+
+关键逻辑：
+  - Deref 时：--nRefAct，若降到 0 则递归（节点属于 MFFC）
+  - Ref 时：++nRefAct，若从 0 升起则递归（节点被新引入）
+  - 返回值：被释放/引入的总面积（不是节点数！）
+
+---------- 便捷封装函数 ----------
+
+Map_CutGetAreaRefed(pCut, fPhase):   [行 335-342]
+  假设 cut 当前被引用，计算其 exact area：
+    deref(pCut)  → 释放，返回面积
+    ref(pCut)    → 恢复
+  适用于：cut 当前在映射中被使用
+
+Map_CutGetAreaDerefed(pCut, fPhase): [行 355-362]
+  假设 cut 当前未被引用，计算其 exact area：
+    ref(pCut)    → 引用，返回面积
+    deref(pCut)  → 恢复
+  适用于：评估一个新的候选 cut
+
+Map_CutRef(pCut, fPhase):  [行 375-378]
+  真实引用 cut（修改 nRefAct，不恢复）
+
+Map_CutDeref(pCut, fPhase): [行 391-394]
+  真实解引用 cut（修改 nRefAct，不恢复）
+
+
+================================================================================
+4. Area Recovery 中 Exact Area 的具体工作流程
+================================================================================
+
+当 fMappingMode == 2 或 3 时，Map_MatchNodePhase() 的工作流程：
+
+---------- Step 1：Deref 旧 cut（真实操作！）----------
+
+  // mapperMatch.c:283-288
+  pMatch = pCutBest->M + fPhase;
+  if ( pNode->nRefAct[fPhase] > 0 ||
+      (pNode->pCutBest[!fPhase] == NULL && pNode->nRefAct[!fPhase] > 0) )
+      pMatch->AreaFlow = Area1 = Map_CutDeref( pCutBest, fPhase );
+  else
+      pMatch->AreaFlow = Area1 = Map_CutGetAreaDerefed( pCutBest, fPhase );
+
+  分析：
+  - 条件判断：节点在当前映射中是否被实际引用
+    · nRefAct[fPhase] > 0：当前相位被直接引用
+    · pCutBest[!fPhase]==NULL && nRefAct[!fPhase]>0：对面相位被引用但
+      没有自己的 cut，必须通过当前相位 + inverter 实现
+  - 如果被引用：调用 Map_CutDeref（真实 deref，修改 nRefAct）
+    → Area1 = 旧 cut 的 MFFC 面积（被释放的面积）
+    → 副作用：旧 MFFC 内节点的 nRefAct 全部降为 0
+  - 如果未被引用：调用 Map_CutGetAreaDerefed（模拟，不修改 nRefAct）
+    → 仅计算面积，不修改状态
+
+---------- Step 2：在"旧 MFFC 已释放"的状态下评估新 cut ----------
+
+  // mapperMatch.c:201-202 (在 Map_MatchNodeCut 内部)
+  if ( p->fMappingMode == 2 || p->fMappingMode == 3 )
+      pMatch->AreaFlow = Map_CutGetAreaDerefed( pCut, fPhase );
+
+  分析：
+  - Map_CutGetAreaDerefed 内部做的是：
+      ref(pCut)    → 临时引用新 cut → 返回引入面积
+      deref(pCut)  → 撤销 → 恢复状态
+  - 此时旧 cut 已经被 deref 了，旧 MFFC 内节点 nRefAct=0
+  - 如果新 cut 的 cone 包含旧 MFFC 的节点：
+    → 这些节点 nRefAct=0，ref 时会被递归引用 → 面积计入
+    → 但因为它们本来就在图中，这反映了"重用"
+  - 如果新 cut 不包含旧 MFFC 的节点：
+    → 它们仍然是 nRefAct=0 的死节点
+
+  精妙之处：不同的新 cut 候选可能重用不同数量的旧 MFFC 节点，
+  exact area 自动反映了这一差异。
+
+---------- Step 3：选择最佳新 cut ----------
+
+  遍历所有候选 cut，通过 Map_MatchCompare 比较：
+  - fMappingMode >= 1 时：area 优先，delay 次之
+  - 选择 exact area 最小且满足 timing 约束的 cut
+
+---------- Step 4：Ref 新 cut（真实操作！）----------
+
+  // mapperMatch.c:341-351
+  if ( p->fMappingMode >= 2 &&
+       (pNode->nRefAct[fPhase] > 0 || ...) )
+  {
+      Area2 = Map_CutRef( pNode->pCutBest[fPhase], fPhase );
+  //  assert( Area2 < Area1 + p->fEpsilon );  ← 注释掉的断言
+  }
+
+  分析：
+  - Map_CutRef 真实引用新选定的 best cut
+  - 返回 Area2 = 新 cut 实际引入的面积
+  - 注释掉的断言揭示了算法的核心不变量：
+      Area2 <= Area1
+    即：新 cut 引入的面积 <= 旧 cut 释放的面积
+    （因为我们选择了 exact area 最小的 cut，且它不会比旧 cut 差）
+
+---------- 净收益 ----------
+
+  净收益 = Area1 - Area2
+         = 旧 MFFC 释放面积 - 新 cut 引入面积
+         >= 0（由选择策略保证）
+
+  每个节点的处理都保证面积非增，整体映射面积单调递减。
+
+
+================================================================================
+5. Exact Area 与 MFFC 的关系：澄清
+================================================================================
+
+问题：exact area 是"借用了 MFFC 的思想"还是"直接在 MFFC 上做的"？
+
+答案：Exact area 借用了 MFFC 的思想，但操作在 mapping 后的 circuit 上。
+
+详细解释：
+
+(a) 思想层面——完全一致
+    MFFC 的核心思想是：通过 deref 找到"独占节点"（nRefs 降到 0 的节点）。
+    Exact area 用完全相同的思想：通过 deref nRefAct 找到 cut 的独占资源。
+
+(b) 操作层面——不同
+    - 原始 MFFC (aigMffc.c)：
+      · 操作在 AIG 图上
+      · 沿 AIG 的 fanin edge 递归
+      · nRefs 是 AIG 节点的 fanout 数
+      · 返回值是节点数
+
+    - Exact area (mapperRefs.c)：
+      · 操作在 mapped circuit 上
+      · 沿 best cut 的叶子递归（不是 AIG fanin）
+      · nRefAct 是 mapping 后的实际引用计数
+      · 返回值是面积（gate area 之和）
+      · 需要处理正/负相位和 inverter
+
+(c) 你的理解是正确的
+    "在 mapping 之后的 circuit 上，重新 deref"——这正是代码做的事情。
+
+    具体地：
+    1. Map_MappingSetRefs() 遍历从 PO 到 PI 的 best cuts，
+       计算每个节点的 nRefAct（实际引用计数）
+    2. Map_CutDeref/Ref 在这些 nRefAct 上做 deref/ref
+    3. 递归沿着 pCutBest（映射后的 cut 结构）展开
+    4. 这等价于在 mapped circuit（不是原始 AIG）上计算 MFFC
+
+(d) 为什么不在原始 AIG 上做？
+    因为 mapping 后的结构和原始 AIG 可能很不同：
+    - 一个 cut 可能覆盖多个 AIG 节点
+    - cut 的叶子对应 AIG 中的某些内部节点
+    - 共享关系取决于 mapping 选择了哪些 cut
+    - 原始 AIG 的 nRefs 不反映 mapping 后的实际使用情况
+
+
+================================================================================
+6. 完整的 Area Recovery 调用链
+================================================================================
+
+mapperCore.c: Map_Mapping()
+│
+├── 阶段 0: fMappingMode = 0
+│   ├── Map_MappingMatches(p)         // delay-optimal mapping
+│   ├── Map_MappingSetRefs(p)         // 计算 nRefAct
+│   └── p->AreaBase = Map_MappingGetArea(p)
+│
+├── 阶段 1: fMappingMode = 1
+│   ├── Map_TimeComputeRequiredGlobal(p)  // required times
+│   ├── Map_MappingEstimateRefs(p)        // 更新 nRefEst (加权平均)
+│   ├── Map_MappingMatches(p)             // area-flow recovery
+│   │   └── Map_CutGetAreaFlow()          // 用 nRefEst 计算 area-flow
+│   ├── Map_MappingSetRefs(p)
+│   └── p->AreaFinal = Map_MappingGetArea(p)
+│
+├── 阶段 2: fMappingMode = 2
+│   ├── Map_TimeComputeRequiredGlobal(p)
+│   ├── Map_MappingMatches(p)             // exact area recovery
+│   │   └── Map_MatchNodePhase()
+│   │       ├── Map_CutDeref(oldCut)      // Step 1: 真实 deref 旧 cut
+│   │       ├── Map_MatchNodeCut()
+│   │       │   └── Map_CutGetAreaDerefed(newCut)  // Step 2: 评估新 cut
+│   │       └── Map_CutRef(newBestCut)    // Step 4: 真实 ref 新 cut
+│   ├── Map_MappingSetRefs(p)
+│   └── p->AreaFinal = Map_MappingGetArea(p)
+│
+└── 阶段 3: fMappingMode = 3
+    ├── (同阶段 2，额外 + Map_NodeTryDroppingOnePhase)
+    ...
+
+注意 nRefEst 的更新策略 (mapperRefs.c:151-165):
+  nRefEst = (3.0 * nRefEst_old + 1.0 * nRefAct) / 4.0
+  → 加权移动平均，让 area-flow 逐渐逼近真实 fanout
+
+
+================================================================================
+7. 关于 Phase 处理的细节
+================================================================================
+
+标准单元库映射（不同于 FPGA 映射）需要处理正/负两个相位：
+
+  nRefAct[0]: 负相位的引用计数
+  nRefAct[1]: 正相位的引用计数
+  nRefAct[2]: 总引用计数（两个相位之和）
+
+在 Map_CutRefDeref 中：
+  - 如果节点两个相位都有 best cut (pCutBest[0] && pCutBest[1])：
+    → 按相位分别计 ref
+    → 当某相位 nRefAct 降到 0 时递归
+  - 如果只有一个相位有 best cut：
+    → 另一个相位通过 inverter 实现
+    → 当 inverter 被引入/移除时，加/减 AreaInv
+
+在 Map_MatchNodePhase 的 deref 条件中：
+  if ( pNode->nRefAct[fPhase] > 0 ||
+      (pNode->pCutBest[!fPhase] == NULL && pNode->nRefAct[!fPhase] > 0) )
+
+  第二个条件的含义：对面相位被引用，但没有自己的 cut，
+  必须通过当前相位 + inverter 来实现。所以当前相位实际上也是"被使用的"。
+
+
+================================================================================
+8. 总结
+================================================================================
+
+  问题                          | 答案
+  ------------------------------|------------------------------------------
+  Exact area 是什么？           | cut 在当前映射中真正引入的独占面积
+  公式                          | 1 + Sum(递归面积 | 独占子节点)
+  如何计算？                    | 在 mapped circuit 上 Deref/Ref nRefAct
+  与 MFFC 的关系                | 借用 MFFC 思想（deref 找独占节点），
+                                | 但操作在 mapping 后的 cut 结构上
+  操作是真实的还是模拟的？      | Step 1 (deref旧cut) 和 Step 4 (ref新cut)
+                                | 是真实修改 nRefAct 的
+                                | Step 2 (评估新cut) 是模拟的 (ref+deref)
+  为什么有效？                  | 每步保证 Area2 <= Area1（面积非增）
+  局限性                        | 贪心局部优化，无全局视野
+  与 area-flow 的配合           | 先用 area-flow 做全局优化，
+                                | 再用 exact area 做局部精化

@@ -27,6 +27,14 @@ ABC_NAMESPACE_IMPL_START
 ///                        DECLARATIONS                              ///
 ////////////////////////////////////////////////////////////////////////
 
+// Profiling variables for If_CutAreaDeref / If_CutAreaRef
+static int    s_IfRD_Depth      = 0;       // current recursion depth
+static int    s_IfRD_CurSize    = 0;       // MFFC size of current top-level call
+static int    s_IfRD_MaxSize    = 0;       // max MFFC size across all calls
+static ABC_INT64_T s_IfRD_TotalSize  = 0;  // sum of all MFFC sizes
+static ABC_INT64_T s_IfRD_CallCount  = 0;  // number of top-level calls
+static abctime     s_IfRD_TotalTime  = 0;  // total time in If_CutAreaDeref+Ref
+
 ////////////////////////////////////////////////////////////////////////
 ///                     FUNCTION DEFINITIONS                         ///
 ////////////////////////////////////////////////////////////////////////
@@ -1058,6 +1066,18 @@ float If_CutAreaDeref( If_Man_t * p, If_Cut_t * pCut )
     If_Obj_t * pLeaf;
     float Area;
     int i;
+    int fTopLevel = (s_IfRD_Depth == 0);
+    abctime clkStart = 0;
+
+    // profiling: top-level call setup
+    if ( fTopLevel )
+    {
+        s_IfRD_CurSize = 0;
+        clkStart = Abc_Clock();
+    }
+    s_IfRD_Depth++;
+    s_IfRD_CurSize++;
+
     Area = If_CutLutArea(p, pCut);
     If_CutForEachLeaf( p, pCut, pLeaf, i )
     {
@@ -1065,6 +1085,16 @@ float If_CutAreaDeref( If_Man_t * p, If_Cut_t * pCut )
         if ( --pLeaf->nRefs > 0 || !If_ObjIsAnd(pLeaf) )
             continue;
         Area += If_CutAreaDeref( p, If_ObjCutBest(pLeaf) );
+    }
+    // profiling: top-level call teardown
+    s_IfRD_Depth--;
+    if ( fTopLevel )
+    {
+        s_IfRD_TotalTime += Abc_Clock() - clkStart;
+        s_IfRD_CallCount++;
+        s_IfRD_TotalSize += s_IfRD_CurSize;
+        if ( s_IfRD_CurSize > s_IfRD_MaxSize )
+            s_IfRD_MaxSize = s_IfRD_CurSize;
     }
     return Area;
 }
@@ -1085,6 +1115,18 @@ float If_CutAreaRef( If_Man_t * p, If_Cut_t * pCut )
     If_Obj_t * pLeaf;
     float Area;
     int i;
+    int fTopLevel = (s_IfRD_Depth == 0);
+    abctime clkStart = 0;
+
+    // profiling: top-level call setup
+    if ( fTopLevel )
+    {
+        s_IfRD_CurSize = 0;
+        clkStart = Abc_Clock();
+    }
+    s_IfRD_Depth++;
+    s_IfRD_CurSize++;
+
     Area = If_CutLutArea(p, pCut);
     If_CutForEachLeaf( p, pCut, pLeaf, i )
     {
@@ -1092,6 +1134,16 @@ float If_CutAreaRef( If_Man_t * p, If_Cut_t * pCut )
         if ( pLeaf->nRefs++ > 0 || !If_ObjIsAnd(pLeaf) )
             continue;
         Area += If_CutAreaRef( p, If_ObjCutBest(pLeaf) );
+    }
+    // profiling: top-level call teardown
+    s_IfRD_Depth--;
+    if ( fTopLevel )
+    {
+        s_IfRD_TotalTime += Abc_Clock() - clkStart;
+        s_IfRD_CallCount++;
+        s_IfRD_TotalSize += s_IfRD_CurSize;
+        if ( s_IfRD_CurSize > s_IfRD_MaxSize )
+            s_IfRD_MaxSize = s_IfRD_CurSize;
     }
     return Area;
 }
@@ -1550,6 +1602,340 @@ int If_CutFilter2( If_Man_t * p, If_Obj_t * pNode, If_Cut_t * pCut )
     //if ( Count )
     //    printf( "%d", Count );
     return 0;
+}
+
+/**function*************************************************************
+
+  synopsis    [Prints and resets If_CutAreaDeref/Ref profiling statistics.]
+
+  description []
+
+  sideeffects []
+
+  seealso     []
+
+***********************************************************************/
+void If_CutAreaRefDerefProfilePrint( char * pStageName )
+{
+    if ( s_IfRD_CallCount > 0 )
+    {
+        printf( "FPGA If_CutAreaDeref/Ref profiling [%s]:\n", pStageName );
+        printf( "  Total time         : %10.2f sec\n",
+            (double)s_IfRD_TotalTime / CLOCKS_PER_SEC );
+        printf( "  Top-level calls    : %lld\n", (long long)s_IfRD_CallCount );
+        printf( "  Max MFFC size      : %d  (nodes visited in single DFS)\n",
+            s_IfRD_MaxSize );
+        printf( "  Average MFFC size  : %.2f\n",
+            (double)s_IfRD_TotalSize / s_IfRD_CallCount );
+        printf( "  Total nodes visited: %lld\n", (long long)s_IfRD_TotalSize );
+    }
+}
+void If_CutAreaRefDerefProfileReset()
+{
+    s_IfRD_Depth     = 0;
+    s_IfRD_CurSize   = 0;
+    s_IfRD_MaxSize   = 0;
+    s_IfRD_TotalSize = 0;
+    s_IfRD_CallCount = 0;
+    s_IfRD_TotalTime = 0;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Deref with MFFC size recording for exact area pruning.]
+
+  Description [Works like If_CutAreaDeref but also records mffcSize for
+  each AND node whose nRefs drops to 0. mffcSize[l] = |S(l)|, the size
+  of l's activation set (including l itself). Also tracks total MFFC
+  size and detects tree structure (no reconvergence).
+
+  The p->pMffcSizes array is lazily allocated on first use.]
+
+  SideEffects [Modifies p->pMffcSizes, p->nMffcTotal, p->fMffcIsTree]
+
+  SeeAlso     [If_CutAreaDeref]
+
+***********************************************************************/
+static float If_CutAreaDerefAndRecord_rec( If_Man_t * p, If_Cut_t * pCut, int * pMffcNodeCount )
+{
+    If_Obj_t * pLeaf;
+    float Area;
+    int i;
+    Area = If_CutLutArea(p, pCut);
+    (*pMffcNodeCount)++;
+    If_CutForEachLeaf( p, pCut, pLeaf, i )
+    {
+        assert( pLeaf->nRefs > 0 );
+        if ( --pLeaf->nRefs > 0 || !If_ObjIsAnd(pLeaf) )
+            continue;
+        // pLeaf->nRefs dropped to 0: it's an MFFC node.
+        // A node's nRefs can only drop to 0 once during a single deref
+        // (reconvergent nodes have nRefs >= 2 and get decremented gradually),
+        // so the stamp check below is a safety assertion, not a branch.
+        assert( p->pMffcStamps[pLeaf->Id] != p->nMffcStamp );
+        float subArea = If_CutAreaDerefAndRecord_rec( p, If_ObjCutBest(pLeaf), pMffcNodeCount );
+        p->pMffcSizes[pLeaf->Id] = subArea;  // |S(l)| = area of l's subtree
+        p->pMffcStamps[pLeaf->Id] = p->nMffcStamp;
+        Area += subArea;
+    }
+    return Area;
+}
+
+float If_CutAreaDerefAndRecord( If_Man_t * p, If_Cut_t * pCut )
+{
+    If_Obj_t * pLeaf;
+    float Area;
+    int i, nMffcNodeCount = 0;
+    int fTopLevel = (s_IfRD_Depth == 0);
+    abctime clkStart = 0;
+
+    // profiling: top-level call setup
+    if ( fTopLevel )
+    {
+        s_IfRD_CurSize = 0;
+        clkStart = Abc_Clock();
+    }
+
+    // lazy allocation of mffcSizes and stamps arrays
+    if ( p->pMffcSizes == NULL )
+    {
+        int nObjs = If_ManObjNum(p);
+        p->pMffcSizes  = ABC_CALLOC( float, nObjs );
+        p->pMffcStamps = ABC_CALLOC( int, nObjs );
+        p->nMffcStamp  = 0;
+    }
+
+    // initialize: new generation stamp invalidates all previous entries
+    p->nMffcStamp++;
+    p->nMffcTotal = 0;
+    p->fMffcIsTree = 1;  // assume tree until reconvergence detected
+
+    // perform deref with recording
+    Area = If_CutLutArea(p, pCut);
+    nMffcNodeCount = 1;  // count the root
+    If_CutForEachLeaf( p, pCut, pLeaf, i )
+    {
+        assert( pLeaf->nRefs > 0 );
+        if ( --pLeaf->nRefs > 0 || !If_ObjIsAnd(pLeaf) )
+            continue;
+        // pLeaf is an MFFC node (nRefs dropped to 0)
+        float subArea = If_CutAreaDerefAndRecord_rec( p, If_ObjCutBest(pLeaf), &nMffcNodeCount );
+        p->pMffcSizes[pLeaf->Id] = subArea;  // |S(l)|
+        p->pMffcStamps[pLeaf->Id] = p->nMffcStamp;
+        Area += subArea;
+    }
+    p->nMffcTotal = nMffcNodeCount - 1;  // exclude root (root is n itself, always nRefs>0)
+
+    // profiling: top-level call teardown
+    if ( fTopLevel )
+    {
+        s_IfRD_TotalTime += Abc_Clock() - clkStart;
+        s_IfRD_CallCount++;
+        s_IfRD_TotalSize += nMffcNodeCount;
+        if ( nMffcNodeCount > s_IfRD_MaxSize )
+            s_IfRD_MaxSize = nMffcNodeCount;
+    }
+    return Area;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Exact area evaluation with submodular bound pruning.]
+
+  Description [Tries O(K) bounds (LB1, LB2, UB1) and fast paths before
+  falling back to full ref/deref. Returns the exact area of the cut.
+  If the cut can be proven suboptimal (LB >= bestArea), returns -1
+  to signal that the cut was pruned.
+
+  Fast Path 1: |M| = 0 → ExactArea = LutArea
+  Fast Path 2: |M| ≤ 1 → ExactArea computable in O(K)
+  Fast Path 3: tree MFFC → UB1 = ExactArea (no overlap)]
+
+  SideEffects []
+
+  SeeAlso     [If_CutAreaDerefed]
+
+***********************************************************************/
+// Set to 1 to enable verification of pruning results against exact computation
+#define IF_PRUNE_VERIFY  1
+
+float If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float bestArea )
+{
+    If_Obj_t * pLeaf;
+    float lutArea, lb1, ub1, maxMffc;
+    int i, nMffcLeaves, fAllValidated;
+
+    p->nExactPrune_Total++;
+
+    if ( pCut->nLeaves < 2 )
+    {
+        p->nExactPrune_FastPath++;
+        return 0;
+    }
+
+    // Bail out if mffcSizes not available (shouldn't happen in Mode=2)
+    if ( p->pMffcSizes == NULL )
+    {
+        p->nExactPrune_Exact++;
+        return If_CutAreaDerefed( p, pCut );
+    }
+
+    lutArea = If_CutLutArea(p, pCut);
+
+    // ---- Compute LB1, UB1, LB2 in O(K) ----
+    // For each leaf, check if it's an MFFC node with a valid stamp.
+    // If any MFFC leaf has a stale stamp (not from current deref),
+    // we can't trust bounds and must fall back to exact computation.
+    lb1 = lutArea;          // LB1 = LutArea + |L(C) ∩ M|
+    ub1 = lutArea;          // UB1 = LutArea + Σ mffcSize[l]
+    maxMffc = 0;            // for LB2 = LutArea + max mffcSize[l]
+    nMffcLeaves = 0;
+    fAllValidated = 1;      // all MFFC leaves have valid stamps?
+
+    If_CutForEachLeaf( p, pCut, pLeaf, i )
+    {
+        if ( pLeaf->nRefs == 0 && If_ObjIsAnd(pLeaf) )
+        {
+            nMffcLeaves++;
+            lb1 += 1.0;
+            // Check stamp: is this MFFC node from our current deref?
+            if ( p->pMffcStamps[pLeaf->Id] == p->nMffcStamp )
+            {
+                float ms = p->pMffcSizes[pLeaf->Id];
+                ub1 += ms;
+                if ( ms > maxMffc )
+                    maxMffc = ms;
+            }
+            else
+            {
+                // Stale entry: this nRefs=0 node was NOT part of current MFFC.
+                // We don't know its activation set size → can't compute UB1.
+                fAllValidated = 0;
+            }
+        }
+    }
+
+    // ---- Fast Path: nMffcLeaves == 0 ----
+    // All leaves are external (nRefs > 0 or CIs) → ExactArea = LutArea
+    if ( nMffcLeaves == 0 )
+    {
+#if IF_PRUNE_VERIFY
+        { float exact = If_CutAreaDerefed(p, pCut);
+          assert( exact < lutArea + 3*p->fEpsilon && exact > lutArea - 3*p->fEpsilon ); }
+#endif
+        p->nExactPrune_FastPath++;
+        return lutArea;
+    }
+
+    // ---- LB1 pruning (always valid, even without stamps) ----
+    // LB1 only uses the count of MFFC leaves, not their sizes
+    if ( lb1 > bestArea - p->fEpsilon )
+    {
+#if IF_PRUNE_VERIFY
+        { float exact = If_CutAreaDerefed(p, pCut);
+          assert( exact > bestArea - 3*p->fEpsilon ); }
+#endif
+        p->nExactPrune_LBPruned++;
+        return -1;
+    }
+
+    // If any MFFC leaf has stale stamp, fall back to exact
+    if ( !fAllValidated )
+    {
+        p->nExactPrune_Exact++;
+        return If_CutAreaDerefed( p, pCut );
+    }
+
+    // ---- From here: all MFFC leaves have valid stamps ----
+
+    // ---- Fast Path: nMffcLeaves == 1 ----
+    // Only one MFFC leaf → ExactArea = LutArea + mffcSize[that leaf]
+    // (no overlap possible with a single set)
+    if ( nMffcLeaves == 1 )
+    {
+        float result = lutArea + maxMffc;
+#if IF_PRUNE_VERIFY
+        { float exact = If_CutAreaDerefed(p, pCut);
+          assert( exact < result + 3*p->fEpsilon && exact > result - 3*p->fEpsilon ); }
+#endif
+        p->nExactPrune_FastPath++;
+        return result;
+    }
+
+    // LB2 = LutArea + max singleton
+    {
+        float lb2 = lutArea + maxMffc;
+        float lb = (lb1 > lb2) ? lb1 : lb2;  // max(LB1, LB2)
+
+        // ---- LB pruning: if lower bound >= bestArea, prune ----
+        if ( lb > bestArea - p->fEpsilon )
+        {
+#if IF_PRUNE_VERIFY
+            { float exact = If_CutAreaDerefed(p, pCut);
+              assert( exact > bestArea - 3*p->fEpsilon ); }
+#endif
+            p->nExactPrune_LBPruned++;
+            return -1;
+        }
+    }
+
+    // ---- Tight bounds: if UB1 ≈ LB, we know the exact value ----
+    {
+        float lb2 = lutArea + maxMffc;
+        float lb = (lb1 > lb2) ? lb1 : lb2;
+        if ( ub1 < lb + p->fEpsilon )
+        {
+#if IF_PRUNE_VERIFY
+            { float exact = If_CutAreaDerefed(p, pCut);
+              assert( exact < ub1 + 3*p->fEpsilon && exact > ub1 - 3*p->fEpsilon ); }
+#endif
+            p->nExactPrune_FastPath++;
+            return ub1;
+        }
+    }
+
+    // ---- Fallback: full ref/deref ----
+    p->nExactPrune_Exact++;
+    return If_CutAreaDerefed( p, pCut );
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Print and reset exact area pruning statistics.]
+
+  Description []
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+void If_CutAreaPruningStatsPrint( If_Man_t * p )
+{
+    if ( p->nExactPrune_Total > 0 )
+    {
+        printf( "Exact area pruning statistics:\n" );
+        printf( "  Total candidates   : %lld\n", (long long)p->nExactPrune_Total );
+        printf( "  Fast path (no DFS) : %lld  (%5.1f%%)\n",
+            (long long)p->nExactPrune_FastPath,
+            100.0 * p->nExactPrune_FastPath / p->nExactPrune_Total );
+        printf( "  LB pruned          : %lld  (%5.1f%%)\n",
+            (long long)p->nExactPrune_LBPruned,
+            100.0 * p->nExactPrune_LBPruned / p->nExactPrune_Total );
+        printf( "  Full ref/deref     : %lld  (%5.1f%%)\n",
+            (long long)p->nExactPrune_Exact,
+            100.0 * p->nExactPrune_Exact / p->nExactPrune_Total );
+        printf( "  Saved DFS calls    : %5.1f%%\n",
+            100.0 * (1.0 - (double)p->nExactPrune_Exact / p->nExactPrune_Total) );
+    }
+}
+void If_CutAreaPruningStatsReset( If_Man_t * p )
+{
+    p->nExactPrune_Total    = 0;
+    p->nExactPrune_FastPath = 0;
+    p->nExactPrune_LBPruned = 0;
+    p->nExactPrune_UBAccept = 0;
+    p->nExactPrune_Exact    = 0;
 }
 
 ////////////////////////////////////////////////////////////////////////

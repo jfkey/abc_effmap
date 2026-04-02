@@ -1,0 +1,295 @@
+================================================================================
+         FPGA IF Mapper: Exact Area 计算详解
+================================================================================
+参考代码: src/map/if/ifCore.c, ifMap.c, ifCut.c, ifUtil.c, if.h
+
+
+================================================================================
+1. 整体映射流程 (ifCore.c: If_ManPerformMappingComb)
+================================================================================
+
+FPGA IF mapper 的映射分为三个阶段，每个阶段调用 If_ManPerformMappingRound()
+并传入不同的 Mode 参数：
+
+  阶段 1: Delay-optimal mapping (Mode=0)
+    → 可能有预处理（fPreprocess）：先 delay mapping，再 delay-2，再 area mapping
+    → 每次重新映射前会 If_ManResetOriginalRefs() 重置 nRefs 为 AIG fanout 数
+    → 目标：得到满足 delay 约束的初始映射
+
+  阶段 2: Area-flow recovery (Mode=1), 循环 nFlowIters 次（默认 1 次）
+    → 使用 area-flow 指标选 cut
+    → area-flow 公式: LutArea(cut) + Sum( bestCut.Area(leaf) / EstRefs(leaf) )
+    → EstRefs 是加权移动平均: (2.0*EstRefs_old + nRefs) / 3.0
+
+  阶段 3: Exact area recovery (Mode=2), 循环 nAreaIters 次（默认 2 次）
+    → 使用 exact area 指标选 cut
+    → 通过 Deref/Ref 在 mapped circuit 上精确计算
+
+  每轮之后可选调用 If_ManImproveMapping()（expand/reduce cut 优化）。
+  每轮结束自动调用 If_ManComputeRequired() 重新计算 required times 和统计。
+
+
+================================================================================
+2. 数据结构：mapped circuit 的组织
+================================================================================
+
+---------- 核心数据结构 (if.h) ----------
+
+  If_Obj_t (AIG 节点):
+    - pFanin0, pFanin1      : AIG 图的两个 fanin（构建时确定，不变）
+    - nRefs (int)            : **在 mapped circuit 中的引用计数**（mapping 期间动态变化）
+    - EstRefs (float)        : 估计引用计数（用于 area-flow）
+    - CutBest (If_Cut_t)     : 当前最佳 cut（内嵌在节点结构中）
+    - pCutSet (If_Set_t*)    : 所有候选 cut 的集合
+
+  If_Cut_t (cut):
+    - nLeaves               : 叶子数量
+    - pLeaves[nLeaves]      : 叶子节点的 ID 数组（指向 AIG 节点）
+    - Delay                  : 该 cut 的延迟
+    - Area                   : 该 cut 的面积指标（area-flow 或 exact area）
+    - Edge                   : 该 cut 的边数指标
+
+---------- Mapped Circuit 的"边" ----------
+
+FPGA IF mapper 中的 mapped circuit **不是显式图结构**，而是通过以下方式
+隐式表达的：
+
+  节点 N 的 best cut 的叶子节点 = N 在 mapped circuit 中的 fanin
+
+  即：如果节点 N 的 CutBest 有叶子 {A, B, C}，则在 mapped circuit 中，
+  N 的输出连接到 A、B、C 的输出。
+
+  这种"边"不是 AIG 的原始边（pFanin0/pFanin1），而是 cut 定义的
+  跨越多层 AIG 节点的逻辑连接。
+
+  宏 If_CutForEachLeaf(p, pCut, pLeaf, i) 遍历 cut 的所有叶子节点，
+  本质上就是遍历 mapped circuit 中该节点的所有 fanin。
+
+---------- nRefs 的含义与计算 ----------
+
+nRefs 有两种含义，取决于上下文：
+
+(a) 初始值（AIG fanout 数）：
+    If_ManResetOriginalRefs() (ifUtil.c:287-301):
+      清零所有 nRefs，然后遍历 AIG：
+      - 对每个 AND 节点: pFanin0->nRefs++, pFanin1->nRefs++
+      - 对每个 CO 节点: pFanin0->nRefs++
+      → 得到的是 AIG 图中的 structural fanout 数
+
+(b) Mapped circuit 中的引用计数：
+    If_ManScanMapping() (ifUtil.c:137-165):
+      清零所有 nRefs，然后从 PO 出发，沿 best cut 的叶子 DFS：
+      if ( pObj->nRefs++ || If_ObjIsCi(pObj) || If_ObjIsConst1(pObj) )
+          return 0.0;
+      → pObj->nRefs++ 先返回旧值再加 1
+      → 第一次访问（nRefs 从 0 变 1）：继续递归该节点的 best cut 叶子
+      → 再次访问（nRefs 已 > 0）：不递归，只增加 nRefs
+      → 最终 nRefs = 该节点在 mapped circuit 中被多少个其他节点的 cut 引用
+
+    注意：If_ManScanMapping 在每轮映射结束后由 If_ManComputeRequired()
+    间接调用，同时收集 mapped nodes 到 p->vMapped 中。
+
+---------- 关键区别：Mode=0 vs Mode=1/2 的 nRefs ----------
+
+  Mode=0 (delay mapping):
+    - nRefs 初始化为 AIG fanout 数（由 If_ManResetOriginalRefs 设置）
+    - EstRefs = nRefs（直接赋值）
+
+  Mode=1 (area-flow):
+    - nRefs 在上一轮结束时被 If_ManScanMapping 重新计算为 mapped circuit 引用数
+    - EstRefs = (2.0 * EstRefs_old + nRefs) / 3.0（加权平均）
+    - area-flow 使用 EstRefs
+
+  Mode=2 (exact area):
+    - nRefs 在上一轮结束时被 If_ManScanMapping 重新计算为 mapped circuit 引用数
+    - 直接使用 nRefs（不使用 EstRefs）
+    - 通过 Deref/Ref 操作动态修改 nRefs
+
+
+================================================================================
+3. Exact Area 的计算：Deref/Ref 机制 (ifCut.c:1064-1195)
+================================================================================
+
+---------- If_CutAreaDeref (ifCut.c:1064-1100) ----------
+
+float If_CutAreaDeref( If_Man_t * p, If_Cut_t * pCut )
+{
+    Area = If_CutLutArea(p, pCut);      // cut 自身 LUT 面积（通常 = 1.0）
+    If_CutForEachLeaf( p, pCut, pLeaf, i )
+    {
+        assert( pLeaf->nRefs > 0 );
+        if ( --pLeaf->nRefs > 0 || !If_ObjIsAnd(pLeaf) )
+            continue;                    // 还有其他引用，或是 PI → 不递归
+        Area += If_CutAreaDeref( p, If_ObjCutBest(pLeaf) );
+                                         // nRefs 降到 0 → MFFC 内节点 → 递归
+    }
+    return Area;
+}
+
+逻辑：
+  1. 对 cut 的每个叶子 pLeaf，执行 --pLeaf->nRefs
+  2. 如果 nRefs 降到 0，说明 pLeaf 只被当前 cut 使用（独占节点）
+     → 它是 MFFC 的内部节点 → 递归 deref pLeaf 的 best cut
+  3. 如果 nRefs > 0，说明 pLeaf 还被其他 cut 使用 → MFFC 边界 → 不递归
+  4. 如果 pLeaf 是 CI（PI/PO）→ 不需要 LUT 实现 → 不递归
+  5. 返回被释放的总 LUT 面积
+
+---------- If_CutAreaRef (ifCut.c:1113-1149) ----------
+
+float If_CutAreaRef( If_Man_t * p, If_Cut_t * pCut )
+{
+    Area = If_CutLutArea(p, pCut);
+    If_CutForEachLeaf( p, pCut, pLeaf, i )
+    {
+        assert( pLeaf->nRefs >= 0 );
+        if ( pLeaf->nRefs++ > 0 || !If_ObjIsAnd(pLeaf) )
+            continue;                    // 已被引用，或是 PI → 不递归
+        Area += If_CutAreaRef( p, If_ObjCutBest(pLeaf) );
+                                         // 从 0 变 1 → 新引入节点 → 递归
+    }
+    return Area;
+}
+
+逻辑：
+  1. 对 cut 的每个叶子 pLeaf，执行 pLeaf->nRefs++（先返回旧值）
+  2. 如果旧值 > 0，说明 pLeaf 已经在 mapped circuit 中 → 不增加面积
+  3. 如果旧值 == 0，说明 pLeaf 是新引入的 → 递归 ref pLeaf 的 best cut
+  4. 返回被引入的总 LUT 面积
+
+---------- 便捷封装函数 ----------
+
+If_CutAreaDerefed(p, pCut):  [行 1162-1172]
+  假设 cut 当前未被引用（derefed 状态），计算其 exact area：
+    ref(pCut)    → 临时引用，返回面积 aResult2
+    deref(pCut)  → 恢复原状，返回面积 aResult
+    assert(aResult ≈ aResult2)  → 两次应该一致
+  用途：评估一个候选 cut 的面积（不修改状态）
+
+If_CutAreaRefed(p, pCut):  [行 1185-1195]
+  假设 cut 当前被引用（refed 状态），计算其 exact area：
+    deref(pCut)  → 临时释放，返回面积 aResult2
+    ref(pCut)    → 恢复原状，返回面积 aResult
+  用途：查询当前 best cut 的面积（不修改状态）
+
+
+================================================================================
+4. Exact Area Recovery 的工作流程 (ifMap.c: If_ObjPerformMappingAnd)
+================================================================================
+
+当 Mode=2 时，If_ObjPerformMappingAnd 的关键逻辑：
+
+---------- Step 1: Deref 旧 cut ----------
+
+  // ifMap.c:182-183
+  if ( Mode && pObj->nRefs > 0 )
+      If_CutAreaDeref( p, If_ObjCutBest(pObj) );
+
+  - 条件：Mode != 0 且节点在 mapped circuit 中被引用 (nRefs > 0)
+  - 操作：调用 If_CutAreaDeref 真实 deref 旧 best cut
+  - 效果：旧 cut 的 MFFC 内节点的 nRefs 全部降为 0
+  - 目的：在评估新 cut 前，先释放旧 cut 占用的资源
+
+---------- Step 2: 评估所有候选 cut ----------
+
+  // ifMap.c:532
+  pCut->Area = (Mode == 2)? If_CutAreaDerefed( p, pCut ) : If_CutAreaFlow( p, pCut );
+
+  - Mode=2 时，对每个候选 cut 调用 If_CutAreaDerefed
+  - If_CutAreaDerefed 内部: ref → deref（模拟操作，不改变最终状态）
+  - 在旧 cut 已 deref 的状态下，如果新 cut 的叶子包含旧 MFFC 的节点：
+    → 这些节点 nRefs=0，ref 时会递归 → 面积计入
+  - 如果新 cut 的叶子不包含旧 MFFC 的节点：
+    → 旧 MFFC 节点仍为 nRefs=0 → 不影响新 cut 面积
+
+---------- Step 3: 选择最佳 cut ----------
+
+  // ifMap.c:546-548
+  if ( !fPreprocess || pCutSet->ppCuts[0]->Delay <= pObj->Required + p->fEpsilon )
+      If_CutCopy( p, If_ObjCutBest(pObj), pCutSet->ppCuts[0] );
+
+  - If_CutSort 按 SortMode=1（area 优先）排序候选 cut
+  - 选择面积最小且满足 timing 约束的 cut 作为新 best cut
+
+---------- Step 4: Ref 新 best cut ----------
+
+  // ifMap.c:568-569
+  if ( Mode && pObj->nRefs > 0 )
+      If_CutAreaRef( p, If_ObjCutBest(pObj) );
+
+  - 调用 If_CutAreaRef 真实 ref 新 best cut
+  - 效果：新 cut 的叶子节点 nRefs 增加
+  - 如果叶子 nRefs 从 0 变 1 → 递归 ref 该叶子的 best cut
+
+---------- 净收益 ----------
+
+  净收益 = Deref面积 - Ref面积
+  由于我们选择了 exact area 最小的 cut，通常 净收益 >= 0。
+
+
+================================================================================
+5. FPGA IF Mapper vs ASIC Mapper (mapper/) 的 Exact Area 对比
+================================================================================
+
+  特性              | FPGA IF (ifCut.c)           | ASIC Mapper (mapperRefs.c)
+  ------------------|-----------------------------|---------------------------------
+  Phase 处理        | 无相位（单一 FPGA LUT）     | 正/负两个相位 (nRefAct[0/1/2])
+  引用计数          | nRefs (单一 int)            | nRefAct[3] (正相位/负相位/总)
+  面积单位          | LUT 个数 (If_CutLutArea)    | Gate 面积 (Map_CutGetRootArea)
+  Cut 存储          | CutBest 内嵌在 If_Obj_t 中  | pCutBest[2] 两个相位各一个
+  Inverter 处理     | 无（LUT 可实现任意函数）    | 有 (AreaInv, inverter 面积)
+  递归结构          | 沿 CutBest 叶子递归         | 沿 pCutBest[fPhase] 叶子递归
+  Deref/Ref 对称性  | 完全对称                    | 需要考虑相位交互
+  EstRefs 更新      | (2*old + new) / 3           | (3*old + new) / 4
+
+  核心思想完全一致：
+  - Deref 时 --nRefs，降到 0 则递归（MFFC 内部节点）
+  - Ref 时 nRefs++，从 0 升起则递归（新引入节点）
+  - Area-flow 先做全局优化，exact area 再做局部精化
+
+  FPGA 版本更简单，因为：
+  1. 只有一个相位（LUT 可实现任意布尔函数及其反函数）
+  2. 没有 inverter 的概念
+  3. LUT 面积通常统一（1.0 或由 LUT library 决定）
+
+
+================================================================================
+6. Area-Flow vs Exact Area 的选择逻辑 (ifMap.c:532)
+================================================================================
+
+  pCut->Area = (Mode == 2) ? If_CutAreaDerefed(p, pCut) : If_CutAreaFlow(p, pCut);
+
+  Mode=1 (area-flow):
+    Area = LutArea(cut) + Sum( bestCut.Area(leaf) / EstRefs(leaf) )
+    - 如果 leaf 的 nRefs==0（未被使用）：直接加 bestCut.Area（不分摊）
+    - 否则：按 EstRefs 比例分摊
+
+  Mode=2 (exact area):
+    Area = 通过 Deref/Ref 精确计算的独占面积
+    - 不涉及估计，直接基于当前 nRefs 状态
+
+
+================================================================================
+7. nRefs 的生命周期总结
+================================================================================
+
+  1. 构建 AIG 时 (ifMan.c:597-598):
+     pFan0->nRefs++; pFan1->nRefs++  → AIG structural fanout
+
+  2. 预处理阶段 (If_ManResetOriginalRefs):
+     清零后重新按 AIG fanout 计算 nRefs
+
+  3. Mode=0 (delay mapping):
+     - 不做 Deref/Ref（Mode=0 跳过）
+     - 映射完成后 If_ManScanMapping 重新计算 nRefs = mapped circuit 引用数
+
+  4. Mode=1 (area-flow):
+     - Step 1: if (Mode && nRefs > 0) If_CutAreaDeref(旧 cut) → 释放
+     - Step 2: 计算 area-flow（使用 EstRefs，不修改 nRefs）
+     - Step 3: if (Mode && nRefs > 0) If_CutAreaRef(新 cut) → 引用
+     - 轮次结束: If_ManScanMapping 重新计算 nRefs
+
+  5. Mode=2 (exact area):
+     - Step 1: if (Mode && nRefs > 0) If_CutAreaDeref(旧 cut) → 真实释放
+     - Step 2: If_CutAreaDerefed(候选 cut) → 模拟评估（ref+deref）
+     - Step 3: if (Mode && nRefs > 0) If_CutAreaRef(新 cut) → 真实引用
+     - 轮次结束: If_ManScanMapping 重新计算 nRefs

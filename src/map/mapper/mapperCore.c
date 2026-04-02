@@ -21,6 +21,10 @@
 
 ABC_NAMESPACE_IMPL_START
 
+// profiling functions from mapperRefs.c
+extern void Map_CutRefDerefProfilePrint( char * pStageName );
+extern void Map_CutRefDerefProfileReset();
+
 
 ////////////////////////////////////////////////////////////////////////
 ///                        DECLARATIONS                              ///
@@ -134,17 +138,19 @@ ABC_PRT( "Time", Abc_Clock() - clk );
         // compute the required times
         Map_TimeComputeRequiredGlobal( p );
         // recover area
+        Map_CutRefDerefProfileReset();
         p->fMappingMode = 2;
         Map_MappingMatches( p );
+        Map_CutRefDerefProfilePrint( "ExactArea-Mode2" );
         // compute the references and collect the nodes used in the mapping
         Map_MappingSetRefs( p );
         p->AreaFinal = Map_MappingGetArea( p );
 if ( p->fVerbose )
 {
-printf( "Area     : %s = %8.2f  Flow = %11.1f  Area = %11.1f  %4.1f %%   ", 
-                    fShowSwitching? "Switch" : "Delay", 
-                    fShowSwitching? Map_MappingGetSwitching(p) : p->fRequiredGlo, 
-                    0.0, p->AreaFinal, 
+printf( "Area     : %s = %8.2f  Flow = %11.1f  Area = %11.1f  %4.1f %%   ",
+                    fShowSwitching? "Switch" : "Delay",
+                    fShowSwitching? Map_MappingGetSwitching(p) : p->fRequiredGlo,
+                    0.0, p->AreaFinal,
                     100.0*(p->AreaBase-p->AreaFinal)/p->AreaBase );
 ABC_PRT( "Time", Abc_Clock() - clk );
 }
@@ -160,17 +166,19 @@ ABC_PRT( "Time", Abc_Clock() - clk );
         // compute the required times
         Map_TimeComputeRequiredGlobal( p );
         // recover area
+        Map_CutRefDerefProfileReset();
         p->fMappingMode = 3;
         Map_MappingMatches( p );
+        Map_CutRefDerefProfilePrint( "ExactArea-Mode3" );
         // compute the references and collect the nodes used in the mapping
         Map_MappingSetRefs( p );
         p->AreaFinal = Map_MappingGetArea( p );
 if ( p->fVerbose )
 {
-printf( "Area     : %s = %8.2f  Flow = %11.1f  Area = %11.1f  %4.1f %%   ", 
-                    fShowSwitching? "Switch" : "Delay", 
-                    fShowSwitching? Map_MappingGetSwitching(p) : p->fRequiredGlo, 
-                    0.0, p->AreaFinal, 
+printf( "Area     : %s = %8.2f  Flow = %11.1f  Area = %11.1f  %4.1f %%   ",
+                    fShowSwitching? "Switch" : "Delay",
+                    fShowSwitching? Map_MappingGetSwitching(p) : p->fRequiredGlo,
+                    0.0, p->AreaFinal,
                     100.0*(p->AreaBase-p->AreaFinal)/p->AreaBase );
 ABC_PRT( "Time", Abc_Clock() - clk );
 }
