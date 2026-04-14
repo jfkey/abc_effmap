@@ -531,9 +531,20 @@ IfMapCutEvalDone:
         // compute area of the cut (this area may depend on the application specific cost)
         if ( Mode == 2 && pObj->nRefs > 0 )
         {
-            // exact area with submodular bound pruning
-            float bestArea = (pCutSet->nCuts > 0) ? pCutSet->ppCuts[0]->Area : IF_FLOAT_LARGE;
-            float area = If_CutAreaDerefedWithPruning( p, pCut, bestArea );
+            // Exact area with submodular bound pruning.
+            // Reference for pruning is the worst cut that the cut set would
+            // currently keep: while there is room (nCuts < nCutsMax) any cut
+            // will be retained by If_CutSort, so pruning is unsafe — set the
+            // reference to +inf. Once the set is full, a cut can be safely
+            // skipped only if its exact area is strictly worse than the
+            // current last kept cut (which is the one that would get dropped
+            // by If_CutSort when a new cut displaces it). Comparing against
+            // ppCuts[0] (the best) would discard cuts that belong at mid
+            // positions and are used later for downstream cut-pair enumeration.
+            float worstKeptArea = (pCutSet->nCuts >= pCutSet->nCutsMax)
+                                ? pCutSet->ppCuts[pCutSet->nCuts - 1]->Area
+                                : IF_FLOAT_LARGE;
+            float area = If_CutAreaDerefedWithPruning( p, pCut, worstKeptArea );
             if ( area < 0 )
                 continue;  // pruned by lower bound
             pCut->Area = area;

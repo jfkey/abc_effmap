@@ -1679,7 +1679,7 @@ void If_CutAreaRefDerefProfileReset()
 // Set to 1 to enable verification of pruning results against exact computation
 #define IF_PRUNE_VERIFY  0
 
-float If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float bestArea )
+float If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float worstKeptArea )
 {
     If_Obj_t * pLeaf;
     float lutArea, lb1, lb2, lb, maxMffc;
@@ -1753,17 +1753,26 @@ float If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float bestAre
         return result;
     }
 
-    // ---- LB pruning: prove cut is strictly suboptimal in O(K) ----
-    // Threshold must match the tie-break semantics in If_ManSortCompare:
-    //   sort treats |A0 - A1| <= fEpsilon as a tie and then breaks on Edge/Power.
-    // Only when lb > bestArea + fEpsilon is exact_area guaranteed to lose by area
-    // alone (no tie-break can revive this cut). Using bestArea - fEpsilon would
-    // discard area-tied cuts whose Edge could have made them the new best, which
-    // cascades into different downstream MFFCs and a different final mapping.
+    // ---- LB pruning: prove cut cannot enter the kept cut set in O(K) ----
+    // worstKeptArea is the area of the last kept cut in pCutSet (the one that
+    // would get dropped if a new cut beats it); the caller passes +inf when
+    // the set still has room, disabling pruning so every cut is retained.
+    //
+    // Threshold must match the tie-break semantics of If_ManSortCompare:
+    //   sort treats |A0 - A1| <= fEpsilon as a tie and then breaks on
+    //   Edge/Power/nLeaves/fUseless. A cut can be safely skipped only when
+    //   its exact area is strictly worse than worstKeptArea (so area alone
+    //   decides the comparison — no tie-break can revive it). Since
+    //   exact >= lb, lb > worstKeptArea + fEpsilon is a sufficient condition.
+    //
+    // Comparing against the top cut ppCuts[0] instead of the worst kept cut
+    // would discard cuts that belong at middle positions of the sorted set;
+    // those middle cuts are consumed later by downstream cut-pair enumeration
+    // and missing them cascades into a different final mapping.
     lb1 = lutArea + (float)nMffcLeaves;  // each MFFC leaf contributes ≥ 1 (itself)
     lb2 = lutArea + maxMffc;             // union covers the largest single S(l)
     lb  = ( lb1 > lb2 ) ? lb1 : lb2;
-    if ( lb > bestArea + p->fEpsilon )
+    if ( lb > worstKeptArea + p->fEpsilon )
     {
 #if IF_PRUNE_VERIFY
         // Shadow mode: do NOT actually prune. Compute the exact area and return

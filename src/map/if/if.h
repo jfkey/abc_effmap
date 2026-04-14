@@ -577,7 +577,7 @@ extern float           If_CutAreaDeref( If_Man_t * p, If_Cut_t * pCut );
 extern float           If_CutAreaRef( If_Man_t * p, If_Cut_t * pCut );
 extern float           If_CutAreaDerefed( If_Man_t * p, If_Cut_t * pCut );
 extern float           If_CutAreaRefed( If_Man_t * p, If_Cut_t * pCut );
-extern float           If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float bestArea );
+extern float           If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float worstKeptArea );
 extern void            If_ManMffcPhiClear( If_Man_t * p );
 extern void            If_CutAreaPruningStatsPrint( If_Man_t * p );
 extern void            If_CutAreaPruningStatsReset( If_Man_t * p );
