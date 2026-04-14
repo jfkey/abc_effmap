@@ -575,3 +575,88 @@ stamp 直接删除
 
 
 如果存在任何不清楚的地方，请随时与我沟通
+
+
+
+结合之前关于 fpga exact area 相关的总结
+/mnt/local_data1/liujunfeng/newMap/abc_effmap/.record/01_fpga_if_exact_area.txt
+/mnt/local_data1/liujunfeng/newMap/abc_effmap/.record/02_fpga_if_mapping_qa.txt
+再阅读 FPGA map if 算子，梳理下
+FPGA if map 的主要函数调用 关系 以及 相关功能， 
+并 回答  If_ObjPerformMappingAnd 为什么每一轮 都要再做一下 Cut merge 呢，
+当 If_ObjPerformMappingAnd  fFirst = 0 的时候，为什么也要做 cut merge 呢
+
+将上面的 内容总结到 .record/
+
+
+
+
+
+下面这是当 IF_PRUNE_VERIFY = 0 时， 基于 /mnt/local_data1/liujunfeng/newMap/abc_effmap/.record/phase1_lazy_phi_rewrite.md
+对 exact area recovery 提高效率的结果 
+
+abc 03> read ../../benchmarks/leon3.aig; if -v -K 6; time; ps
+K = 6. Memory (bytes): Truth =    0. Cut =   72. Obj =  152. Set =  744. CutMin = no
+Node = 1088122.  Ch =     0.  Total mem =  274.13 MB. Peak cut mem =   17.48 MB.
+P:  Del =   13.00.  Ar =  494756.0.  Edge =  2206743.  Cut = 15584284.  T =     7.64 sec
+P:  Del =   13.00.  Ar =  305089.0.  Edge =  1435594.  Cut = 10991429.  T =     5.59 sec
+P:  Del =   13.00.  Ar =  304975.0.  Edge =  1291991.  Cut = 15122288.  T =     7.15 sec
+E:  Del =   13.00.  Ar =  304076.0.  Edge =  1288241.  Cut = 15122288.  T =     1.08 sec
+F:  Del =   13.00.  Ar =  301809.0.  Edge =  1290458.  Cut = 12313072.  T =     5.51 sec
+E:  Del =   13.00.  Ar =  301668.0.  Edge =  1289831.  Cut = 12313072.  T =     1.09 sec
+FPGA If_CutAreaDeref/Ref profiling [AreaFlow]:
+  Total time         :       0.54 sec
+  Top-level calls    : 3022672
+  Max MFFC size      : 609  (nodes visited in single DFS)
+  Average MFFC size  : 2.41
+  Total nodes visited: 7294548
+A:  Del =   13.00.  Ar =  301045.0.  Edge =  1246442.  Cut = 11753300.  T =     7.85 sec
+E:  Del =   13.00.  Ar =  300981.0.  Edge =  1246364.  Cut = 11753300.  T =     1.07 sec
+A:  Del =   13.00.  Ar =  300950.0.  Edge =  1246219.  Cut = 11603342.  T =     7.66 sec
+E:  Del =   13.00.  Ar =  300949.0.  Edge =  1246218.  Cut = 11603342.  T =     1.07 sec
+FPGA If_CutAreaDeref/Ref profiling [ExactArea]:
+  Total time         :       4.61 sec
+  Top-level calls    : 37893548
+  Max MFFC size      : 605  (nodes visited in single DFS)
+  Average MFFC size  : 1.88
+  Total nodes visited: 71090209
+Exact area pruning statistics:
+  Total candidates   : 3620437
+  Fast path (no DFS) : 2392808  ( 66.1%)
+  LB pruned          : 1086159  ( 30.0%)
+  Full ref/deref     : 141470  (  3.9%)
+  Saved DFS calls    :  96.1%
+Total time =    45.98 sec
+Duplicated 67965 gates to decouple the CO drivers.
+elapse: 52.25 seconds, total: 55.84 seconds
+../../benchmarks/leon3        : i/o =370159/252691  lat =    0  nd =368969  edge =1322367  aig  =1333705  lev = 13
+abc 05> 
+
+这是 原始 abc 的结果： /mnt/local_data1/liujunfeng/newMap/abc_effmap/build/abc_original
+abc 04> read ../../benchmarks/leon3.aig; if -v -K 6; time; ps
+K = 6. Memory (bytes): Truth =    0. Cut =   72. Obj =  152. Set =  744. CutMin = no
+Node = 1088122.  Ch =     0.  Total mem =  274.13 MB. Peak cut mem =   17.48 MB.
+P:  Del =   13.00.  Ar =  494756.0.  Edge =  2206743.  Cut = 15584284.  T =     7.34 sec
+P:  Del =   13.00.  Ar =  305089.0.  Edge =  1435594.  Cut = 10991429.  T =     5.99 sec
+P:  Del =   13.00.  Ar =  304975.0.  Edge =  1291991.  Cut = 15122288.  T =     7.41 sec
+E:  Del =   13.00.  Ar =  304076.0.  Edge =  1288241.  Cut = 15122288.  T =     0.98 sec
+F:  Del =   13.00.  Ar =  301809.0.  Edge =  1290458.  Cut = 12313072.  T =     5.80 sec
+E:  Del =   13.00.  Ar =  301668.0.  Edge =  1289831.  Cut = 12313072.  T =     0.99 sec
+A:  Del =   13.00.  Ar =  301043.0.  Edge =  1246304.  Cut = 12724063.  T =     8.82 sec
+E:  Del =   13.00.  Ar =  300979.0.  Edge =  1246228.  Cut = 12724063.  T =     0.98 sec
+A:  Del =   13.00.  Ar =  300949.0.  Edge =  1246079.  Cut = 12576927.  T =     8.54 sec
+E:  Del =   13.00.  Ar =  300948.0.  Edge =  1246080.  Cut = 12576927.  T =     0.99 sec
+Total time =    48.10 sec
+Duplicated 67965 gates to decouple the CO drivers.
+elapse: 54.59 seconds, total: 62.71 seconds
+../../../benchmarks/leon3     : i/o =370159/252691  lat =    0  nd =368968  edge =1322229  aig  =1333568  lev = 13
+abc 06>
+
+基于子模函数的思路，应该两者是完全一样的结果，为什么 结果不一样呢， 是子模函数本身的定义有问题吗
+还是上下界的设置有问题 
+请梳理 为什么存在该 bug 
+
+以及如何IF_PRUNE_VERIFY 能保证和 不用 子模函数 对 abc exact area recovery 和 使用 子模函数 在 exact area 时候 cut 的选择是一致的 
+我要保证 子模函数 加速 应该不影响 最后的 mapping result
+
+

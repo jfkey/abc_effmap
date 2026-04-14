@@ -1677,7 +1677,7 @@ void If_CutAreaRefDerefProfileReset()
 
 ***********************************************************************/
 // Set to 1 to enable verification of pruning results against exact computation
-#define IF_PRUNE_VERIFY  1
+#define IF_PRUNE_VERIFY  0
 
 float If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float bestArea )
 {
@@ -1753,18 +1753,29 @@ float If_CutAreaDerefedWithPruning( If_Man_t * p, If_Cut_t * pCut, float bestAre
         return result;
     }
 
-    // ---- LB pruning: prove cut is suboptimal in O(K) ----
+    // ---- LB pruning: prove cut is strictly suboptimal in O(K) ----
+    // Threshold must match the tie-break semantics in If_ManSortCompare:
+    //   sort treats |A0 - A1| <= fEpsilon as a tie and then breaks on Edge/Power.
+    // Only when lb > bestArea + fEpsilon is exact_area guaranteed to lose by area
+    // alone (no tie-break can revive this cut). Using bestArea - fEpsilon would
+    // discard area-tied cuts whose Edge could have made them the new best, which
+    // cascades into different downstream MFFCs and a different final mapping.
     lb1 = lutArea + (float)nMffcLeaves;  // each MFFC leaf contributes ≥ 1 (itself)
     lb2 = lutArea + maxMffc;             // union covers the largest single S(l)
     lb  = ( lb1 > lb2 ) ? lb1 : lb2;
-    if ( lb > bestArea - p->fEpsilon )
+    if ( lb > bestArea + p->fEpsilon )
     {
 #if IF_PRUNE_VERIFY
-        { float exact = If_CutAreaDerefed( p, pCut );
-          assert( exact > bestArea - 3*p->fEpsilon ); }
-#endif
+        // Shadow mode: do NOT actually prune. Compute the exact area and return
+        // it so the caller's If_CutSort still sees this cut and tie-breaks on
+        // Edge/Power just like the no-prune baseline. This lets a diff against
+        // the baseline mapping catch any tie-break correctness violation.
+        p->nExactPrune_LBPruned++;
+        return If_CutAreaDerefed( p, pCut );
+#else
         p->nExactPrune_LBPruned++;
         return -1;
+#endif
     }
 
     // ---- Fallback: full ref/deref. ref+deref preserves the fully-derefed state. ----
