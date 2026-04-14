@@ -89,7 +89,7 @@ ABC_INT64_T nExactPrune_Exact;    // 需要完整 ref/deref 的数量
 
 #### `If_CutAreaPruningStatsPrint/Reset()`
 打印和重置 5 个统计计数器。
-
+3. 
 ### `src/map/if/ifMap.c` — Mode=2 路径
 
 ```c

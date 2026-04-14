@@ -374,6 +374,43 @@ elapse: 55.77 seconds, total: 70.58 seconds
 
 每个平均调用 If_CutAreaDeref  45606718 + 3022672 /1088122 = 42 次 
 
+
+abc 01> read ../../benchmarks/leon3.aig; ps; if -v -K 6; time; ps 
+../../benchmarks/leon3        : i/o =370159/252691  lat =    0  and =1088122  lev = 59
+K = 6. Memory (bytes): Truth =    0. Cut =   72. Obj =  152. Set =  744. CutMin = no
+Node = 1088122.  Ch =     0.  Total mem =  274.13 MB. Peak cut mem =   17.48 MB.
+P:  Del =   13.00.  Ar =  494756.0.  Edge =  2206743.  Cut = 15584284.  T =     7.23 sec
+P:  Del =   13.00.  Ar =  305089.0.  Edge =  1435594.  Cut = 10991429.  T =     6.83 sec
+P:  Del =   13.00.  Ar =  304975.0.  Edge =  1291991.  Cut = 15122288.  T =     7.98 sec
+E:  Del =   13.00.  Ar =  304076.0.  Edge =  1288241.  Cut = 15122288.  T =     1.11 sec
+F:  Del =   13.00.  Ar =  301809.0.  Edge =  1290458.  Cut = 12313072.  T =     5.54 sec
+E:  Del =   13.00.  Ar =  301668.0.  Edge =  1289831.  Cut = 12313072.  T =     1.10 sec
+FPGA If_CutAreaDeref/Ref profiling [AreaFlow]:
+  Total time         :       0.53 sec
+  Top-level calls    : 3022672
+  Max MFFC size      : 609  (nodes visited in single DFS)
+  Average MFFC size  : 2.41
+  Total nodes visited: 7294548
+A:  Del =   13.00.  Ar =  301057.0.  Edge =  1247229.  Cut =  9500887.  T =     5.82 sec
+E:  Del =   13.00.  Ar =  300993.0.  Edge =  1247152.  Cut =  9500887.  T =     1.07 sec
+A:  Del =   13.00.  Ar =  300962.0.  Edge =  1246998.  Cut =  9421376.  T =     5.74 sec
+E:  Del =   13.00.  Ar =  300961.0.  Edge =  1246997.  Cut =  9421376.  T =     1.08 sec
+FPGA If_CutAreaDeref/Ref profiling [ExactArea]:
+  Total time         :       3.58 sec
+  Top-level calls    : 28717208
+  Max MFFC size      : 605  (nodes visited in single DFS)
+  Average MFFC size  : 1.89
+  Total nodes visited: 54386983
+Exact area pruning statistics:
+  Total candidates   : 3094210
+  Fast path (no DFS) : 1187293  ( 38.4%)
+  LB pruned          : 1626498  ( 52.6%)
+  Full ref/deref     : 280419  (  9.1%)
+  Saved DFS calls    :  90.9%
+Total time =    43.77 sec
+Duplicated 67965 gates to decouple the CO drivers.
+elapse: 50.47 seconds, total: 50.47 seconds
+../../benchmarks/leon3        : i/o =370159/252691  lat =    0  nd =368981  edge =1323146  aig  =1334658  lev = 13
  
 
 

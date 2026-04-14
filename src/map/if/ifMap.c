@@ -180,12 +180,7 @@ void If_ObjPerformMappingAnd( If_Man_t * p, If_Obj_t * pObj, int Mode, int fPrep
         pObj->EstRefs = (float)((2.0 * pObj->EstRefs + pObj->nRefs) / 3.0);
     // deref the selected cut
     if ( Mode && pObj->nRefs > 0 )
-    {
-        if ( Mode == 2 )
-            If_CutAreaDerefAndRecord( p, If_ObjCutBest(pObj) );
-        else
-            If_CutAreaDeref( p, If_ObjCutBest(pObj) );
-    }
+        If_CutAreaDeref( p, If_ObjCutBest(pObj) );
 
     // prepare the cutset
     pCutSet = If_ManSetupNodeCutSet( p, pObj );
@@ -582,6 +577,9 @@ IfMapCutEvalDone:
     // ref the selected cut
     if ( Mode && pObj->nRefs > 0 )
         If_CutAreaRef( p, If_ObjCutBest(pObj) );
+    // clear the lazy mffc-size cache built up while pruning this node
+    if ( Mode == 2 && p->vMffcPhi && Vec_IntSize(p->vMffcPhi) > 0 )
+        If_ManMffcPhiClear( p );
     if ( If_ObjCutBest(pObj)->fUseless )
         Abc_Print( 1, "The best cut is useless.  Please increase the number of cuts used by the mapper, for example: \"&if -C 32\"\n" );
     // call the user specified function for each cut
